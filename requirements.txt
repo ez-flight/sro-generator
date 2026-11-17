@@ -1,0 +1,7 @@
+numpy>=1.26
+shapely>=2.0
+pyproj>=3.6
+pydantic>=2.0
+matplotlib>=3.8
+streamlit>=1.30
+pytest>=8.0

@@ -1,0 +1,44 @@
+{
+  "name": "random_district_demo",
+  "seed": 42,
+  "district": {
+    "center_lat": 55.0,
+    "center_lon": 60.0,
+    "width_km": 100.0,
+    "height_km": 90.0,
+    "rotation_deg": 0.0
+  },
+  "objects": {
+    "count": 25,
+    "vertices_min": 3,
+    "vertices_max": 10,
+    "area_min_m2": 500000.0,
+    "area_max_m2": 5000000.0,
+    "irregularity": 0.35,
+    "rotation_min_deg": 0.0,
+    "rotation_max_deg": 360.0,
+    "max_aspect_ratio": 2.5
+  },
+  "placement": {
+    "mode": "random",
+    "min_distance_m": 500.0,
+    "boundary_margin_m": 100.0,
+    "allow_overlap": false,
+    "max_overlap_fraction": 0.0,
+    "max_attempts_per_object": 10000,
+    "manual_centers": []
+  },
+  "attributes": {
+    "class_labels": ["warehouse", "industrial", "transport"],
+    "priority_min": 1,
+    "priority_max": 5,
+    "deadline_choices_h": [30, 48],
+    "resolution_choices_m": [0.5, 1.0]
+  },
+  "frames": {
+    "enabled": true,
+    "along_track_km": 5.0,
+    "cross_track_km": 5.0,
+    "pass_azimuths_deg": [194.0, 346.0]
+  }
+}
