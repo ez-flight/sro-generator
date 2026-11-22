@@ -92,6 +92,8 @@ class PlacementConfig(BaseModel):
     max_overlap_fraction: float = Field(0.0, ge=0.0, le=1.0)
     max_attempts_per_object: int = Field(..., gt=0)
     manual_centers: list[ManualCenter] = Field(default_factory=list)
+    center_region_mode: Literal["exact", "legacy"] = "exact"
+    spatial_index: bool = True
 
     @model_validator(mode="after")
     def _check(self) -> "PlacementConfig":
@@ -107,6 +109,8 @@ class PlacementConfig(BaseModel):
             )
         if self.max_attempts_per_object < 1:
             raise ConfigError("placement.max_attempts_per_object: число попыток должно быть положительным.")
+        if self.center_region_mode not in ("exact", "legacy"):
+            raise ConfigError("placement.center_region_mode: допустимые значения «exact» и «legacy».")
         ids = [c.object_id for c in self.manual_centers]
         if len(ids) != len(set(ids)):
             raise ConfigError("placement.manual_centers: идентификаторы object_id ручных центров должны быть уникальными.")

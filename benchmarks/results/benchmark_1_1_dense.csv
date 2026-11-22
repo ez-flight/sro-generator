@@ -1,0 +1,5 @@
+objects_count,seed,combo,ok,error,duration_s,peak_mem_mb,n_objects,attempts_total,exact_checks_total,tree_queries,tree_rebuilds,fill_ratio,region_area_mean_m2,equivalence_ok
+2000,555000,legacy+brute,True,,31.2557,1.69,2000,4972,2590015,0,0,0.03103642,1573736434.5,True
+2000,555000,legacy+strtree,True,,7.0524,1.05,2000,4972,1097,2847,32,0.03103642,1573736434.5,True
+2000,555000,exact+brute,True,,32.2726,1.07,2000,2885,2609590,0,0,0.03126881,1576529838.3,True
+2000,555000,exact+strtree,True,,8.689,1.03,2000,2885,1155,2884,32,0.03126881,1576529838.3,True

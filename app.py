@@ -1,11 +1,17 @@
 """Графический интерфейс генератора района СРО (Streamlit).
 
+Одиночный прогон: кнопка «Сгенерировать».
+Серия прогонов: задайте число прогонов и потоков — прогоны выполняются
+параллельно (seed = базовый … базовый + N − 1) и сводятся в статистику.
+
 Запуск: streamlit run app.py
 """
 
 from __future__ import annotations
 
 import io
+import os
+import tempfile
 
 import pandas as pd
 import streamlit as st
@@ -14,6 +20,12 @@ from sro_generator.config import ConfigError, ScenarioConfig
 from sro_generator.export import render_preview
 from sro_generator.generator import generate_scenario
 from sro_generator.placement import PlacementError
+from sro_generator.stats import (
+    render_analytics_charts,
+    render_report_charts,
+    run_batch,
+    write_batch_csv,
+)
 
 st.set_page_config(page_title="Генератор района СРО", layout="wide")
 st.title("Генератор района со случайно расположенными объектами (СРО)")
@@ -67,7 +79,15 @@ with st.sidebar:
     azimuths = st.text_input("Азимуты пролёта, град (через запятую)", "194.0, 346.0")
 
     st.header("Воспроизводимость")
-    seed = st.number_input("Seed", value=42, step=1)
+    seed = st.number_input("Seed (базовый)", value=42, step=1)
+
+    st.header("Серия прогонов")
+    n_runs = st.number_input("Число прогонов", value=10, min_value=2, max_value=2000, step=10)
+    workers = st.number_input(
+        "Параллельных потоков",
+        value=min(4, os.cpu_count() or 1),
+        min_value=1, max_value=32, step=1,
+    )
 
 st.subheader("Ручные центры (пусто — полностью случайное размещение)")
 centers_df = st.data_editor(
@@ -79,11 +99,11 @@ centers_df = st.data_editor(
 show_frames = st.checkbox("Показывать кадры на рисунке", value=True) if frames_enabled else False
 show_labels = st.checkbox("Подписи object_id", value=True)
 
-if st.button("Сгенерировать", type="primary"):
-    manual_centers = []
-    errors = []
-    seen = set()
-    for idx, row in centers_df.iterrows():
+
+def parse_manual_centers(df) -> tuple[list[dict], list[str]]:
+    """Разобрать таблицу ручных центров; вернуть (центры, ошибки)."""
+    manual_centers, errors, seen = [], [], set()
+    for idx, row in df.iterrows():
         oid = str(row.get("object_id") or "").strip()
         lat, lon = row.get("latitude"), row.get("longitude")
         if not oid and pd.isna(lat) and pd.isna(lon):
@@ -99,12 +119,12 @@ if st.button("Сгенерировать", type="primary"):
             manual_centers.append({"object_id": oid, "latitude": float(lat), "longitude": float(lon)})
         except (TypeError, ValueError):
             errors.append(f"Строка {idx + 1}: latitude/longitude должны быть числами.")
-    if errors:
-        for e in errors:
-            st.error(e)
-        st.stop()
+    return manual_centers, errors
 
-    config_dict = {
+
+def build_config(manual_centers: list[dict]) -> dict:
+    """Собрать конфигурацию из параметров сайдбара (та же структура, что и раньше)."""
+    return {
         "name": name,
         "seed": int(seed),
         "district": {
@@ -148,6 +168,16 @@ if st.button("Сгенерировать", type="primary"):
             "pass_azimuths_deg": [float(a) for a in azimuths.split(",") if a.strip()] if frames_enabled else [],
         },
     }
+
+
+if st.button("Сгенерировать", type="primary"):
+    manual_centers, errors = parse_manual_centers(centers_df)
+    if errors:
+        for e in errors:
+            st.error(e)
+        st.stop()
+
+    config_dict = build_config(manual_centers)
     try:
         config = ScenarioConfig.model_validate(config_dict)
     except ConfigError as exc:
@@ -202,3 +232,135 @@ if st.button("Сгенерировать", type="primary"):
         buf.write(f.read())
     st.download_button("Скачать preview.png", buf.getvalue(), file_name="preview.png", mime="image/png")
     st.session_state["scenario"] = scenario
+
+st.divider()
+st.subheader("Серия прогонов для анализа и статистики")
+st.caption(
+    f"Каждый прогон — независимая генерация со своим seed "
+    f"({int(seed)} … {int(seed) + int(n_runs) - 1}). Прогоны идут параллельно в {int(workers)} поток(ах); "
+    "упавшие прогоны фиксируются и не прерывают серию."
+)
+
+if st.button(f"Запустить серию: {int(n_runs)} прогонов", type="primary"):
+    manual_centers, errors = parse_manual_centers(centers_df)
+    if errors:
+        for e in errors:
+            st.error(e)
+        st.stop()
+    config_dict = build_config(manual_centers)
+    try:
+        ScenarioConfig.model_validate(config_dict)
+    except ConfigError as exc:
+        st.error(f"Ошибка конфигурации: {exc}")
+        st.stop()
+
+    progress = st.progress(0.0, text="Серия прогонов…")
+    batch = run_batch(
+        config_dict,
+        n_runs=int(n_runs),
+        workers=int(workers),
+        seed_start=int(seed),
+        progress=lambda done, total: progress.progress(done / total, text=f"Прогонов завершено: {done}/{total}"),
+    )
+    progress.empty()
+    st.session_state["batch"] = batch
+    st.session_state["batch_dir"] = tempfile.mkdtemp(prefix="sro_batch_")
+
+
+def render_batch(batch: dict, out_dir: str) -> None:
+    """Показать результаты серии: метрики, графики, таблицы, выгрузки."""
+    s = batch["summary"]
+    st.success(f"Серия завершена: успешно {s['n_ok']} из {s['n_runs']} прогонов.")
+    if s["n_failed"]:
+        st.warning(f"Упавших прогонов: {s['n_failed']} (см. вкладку «Ошибки»).")
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Попыток размещения (среднее)", f"{s['attempts_total']['mean']:,.0f}")
+    m2.metric("Время прогона, с (среднее)", f"{s['duration_s']['mean']:.3f}")
+    m3.metric("Fill ratio (среднее)", f"{s['fill_ratio']['mean']:.4f}")
+    m4.metric("Покрытие объектов (среднее)", f"{s['coverage_fraction']['mean']:.3f}")
+    m5.metric("Доля полных кадров", f"{s['full_coverage_share']:.1%}")
+
+    tab_charts, tab_analytics, tab_runs, tab_files, tab_errors = st.tabs(
+        ["Графики", "Аналитика", "Прогоны", "CSV", "Ошибки"]
+    )
+
+    chart_paths = render_report_charts(batch, out_dir)
+    csv_paths = write_batch_csv(batch, out_dir)
+
+    with tab_charts:
+        for p in chart_paths.values():
+            st.image(str(p))
+
+    with tab_analytics:
+        st.caption(
+            "Статистические проверки — это проверки согласия с заявленной гипотезой, "
+            "а не доказательство равномерности: ограничения размещения систематически "
+            "меняют распределение принимаемых объектов."
+        )
+        tests = s.get("statistical_tests", {})
+        if tests:
+            st.dataframe(pd.DataFrame([
+                {
+                    "тест": name,
+                    "тип": t.get("kind"),
+                    "статистика": (round(t["statistic"], 6)
+                                   if isinstance(t.get("statistic"), float) else None),
+                    "df": t.get("df"),
+                    "p-value": (round(t["p_value"], 6)
+                                if isinstance(t.get("p_value"), float) else None),
+                    "n": t.get("n"),
+                    "применим": t.get("applicable"),
+                    "предупреждения": " | ".join(t.get("warnings", [])),
+                }
+                for name, t in tests.items()
+            ]))
+        if s.get("clark_evans_warnings"):
+            for w in s["clark_evans_warnings"]:
+                st.warning(w)
+        analytics_paths = render_analytics_charts(batch, out_dir)
+        for p in analytics_paths.values():
+            st.image(str(p))
+
+    with tab_runs:
+        st.dataframe(pd.DataFrame([
+            {
+                "seed": r["seed"],
+                "ok": r["ok"],
+                "duration_s": round(r.get("duration_s", 0.0), 4),
+                "attempts_total": r.get("attempts_total"),
+                "fill_ratio": round(r.get("fill_ratio", 0.0), 6),
+                "nnd_mean_m": round(r.get("nnd_mean_m", 0.0), 1),
+                "n_objects": len(r.get("objects", [])),
+                "frames_total": len(r.get("coverage", [])),
+                "full_coverage_frames": r.get("full_coverage_frames"),
+                "warnings": len(r.get("warnings", [])),
+            }
+            for r in batch["runs"]
+        ]))
+        st.caption(
+            "χ²/df: вершины = %.3g, категории = %.3g, ячейки района = %.3g "
+            "(значения около 1.0 — распределение близко к равномерному)"
+            % (s["vertex_chi2_df"], s["class_chi2_df"], s["quadrant_chi2_df"])
+        )
+
+    with tab_files:
+        for name_csv, p in csv_paths.items():
+            with open(p, "rb") as f:
+                st.download_button(f"Скачать {name_csv}", f.read(), file_name=name_csv, mime="text/csv")
+        st.caption(
+            "runs_summary.csv — метрики по каждому прогону; "
+            "objects_all.csv — все объекты всех прогонов (для pandas/R: сводные таблицы, критерии согласия, корреляции)."
+        )
+
+    with tab_errors:
+        if s["errors"]:
+            for e in s["errors"]:
+                st.error(f"seed={e['seed']}: {e['error']}")
+        else:
+            st.info("Ошибок нет — все прогоны завершились успешно.")
+
+
+batch = st.session_state.get("batch")
+if batch:
+    render_batch(batch, st.session_state.get("batch_dir") or tempfile.mkdtemp(prefix="sro_batch_"))

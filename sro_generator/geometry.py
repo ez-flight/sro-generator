@@ -10,8 +10,8 @@ import math
 
 import numpy as np
 from pyproj import CRS, Transformer
-from shapely.affinity import rotate, scale
-from shapely.geometry import Point, Polygon
+from shapely.affinity import rotate
+from shapely.geometry import Polygon
 
 
 class LocalCRS:
@@ -60,6 +60,44 @@ def _sorted_random_angles(rng: np.random.Generator, n: int, irregularity: float)
     return np.sort(angles)
 
 
+def polygon_aspect_ratio(poly: Polygon) -> float:
+    """Отношение длинной стороны ориентированного описанного прямоугольника к короткой (≥ 1)."""
+    rect = poly.minimum_rotated_rectangle
+    rcoords = list(rect.exterior.coords)[:-1]
+    if len(rcoords) < 3:
+        return 1.0
+    sides = [math.hypot(rcoords[(i + 1) % len(rcoords)][0] - rcoords[i][0],
+                        rcoords[(i + 1) % len(rcoords)][1] - rcoords[i][1])
+             for i in range(len(rcoords))]
+    long_s = max(sides)
+    short_s = max(min(sides), 1e-12)
+    return long_s / short_s
+
+
+def _squeeze_along_long_axis(pts: np.ndarray, ratio: float, max_aspect_ratio: float) -> np.ndarray:
+    """Сжать точки вдоль длинной оси ориентированного прямоугольника до отношения сторон max_aspect_ratio."""
+    poly = Polygon(pts)
+    rect = poly.minimum_rotated_rectangle
+    rcoords = list(rect.exterior.coords)[:-1]
+    side_a = math.hypot(rcoords[1][0] - rcoords[0][0], rcoords[1][1] - rcoords[0][1])
+    side_b = math.hypot(rcoords[2][0] - rcoords[1][0], rcoords[2][1] - rcoords[1][1])
+    if side_a >= side_b:
+        axis_vec = np.array([rcoords[1][0] - rcoords[0][0], rcoords[1][1] - rcoords[0][1]])
+    else:
+        axis_vec = np.array([rcoords[2][0] - rcoords[1][0], rcoords[2][1] - rcoords[1][1]])
+    norm = np.linalg.norm(axis_vec)
+    if norm <= 0:
+        return pts
+    axis_vec = axis_vec / norm
+    proj = pts @ axis_vec
+    center_proj = float(proj.mean())
+    factor = max_aspect_ratio / ratio
+    proj_new = center_proj + (proj - center_proj) * factor
+    perp = np.array([-axis_vec[1], axis_vec[0]])
+    proj_perp = pts @ perp
+    return np.outer(proj_new, axis_vec) + np.outer(proj_perp, perp)
+
+
 def generate_polygon_shape(
     rng: np.random.Generator,
     vertex_count: int,
@@ -71,8 +109,15 @@ def generate_polygon_shape(
     """Сгенерировать простой многоугольник заданной площади вокруг локального начала координат.
 
     irregularity=0 — правильный многоугольник; больше 0 — случайные радиусы и разброс углов.
-    Форма масштабируется относительно центра до целевой площади.
+    Форма масштабируется относительно центра до целевой площади. После всех преобразований
+    выполняется итоговая проверка инвариантов: простота, число вершин, площадь, отношение сторон.
     """
+    if vertex_count < 3:
+        raise ValueError("Число вершин многоугольника должно быть не меньше 3.")
+    if target_area_m2 <= 0.0:
+        raise ValueError("Целевая площадь многоугольника должна быть положительной.")
+    if max_aspect_ratio <= 1.0:
+        raise ValueError("max_aspect_ratio должно быть больше 1.")
     angles = _sorted_random_angles(rng, vertex_count, irregularity)
     if irregularity == 0.0:
         radii = np.full(vertex_count, 1.0)
@@ -81,50 +126,65 @@ def generate_polygon_shape(
         radii = np.clip(radii, 0.05, None)
     pts = np.column_stack([radii * np.cos(angles), radii * np.sin(angles)])
     poly = Polygon(pts)
-    if not poly.is_valid or poly.area <= 0.0:
+    if not poly.is_valid or poly.area <= 0.0 or not poly.is_simple:
         raise ValueError("Сгенерированный многоугольник невалиден.")
 
     # ограничение отношения сторон через ориентированный описанный прямоугольник
-    rect = poly.minimum_rotated_rectangle
-    rcoords = list(rect.exterior.coords)[:-1]
-    side_a = Point(rcoords[0]).distance(Point(rcoords[1]))
-    side_b = Point(rcoords[1]).distance(Point(rcoords[2]))
-    long_s, short_s = max(side_a, side_b), max(min(side_a, side_b), 1e-9)
-    ratio = long_s / short_s
+    ratio = polygon_aspect_ratio(poly)
     if ratio > max_aspect_ratio:
-        # определяем ось длинной стороны и сжимаем её
-        if side_a >= side_b:
-            axis_vec = np.array([rcoords[1][0] - rcoords[0][0], rcoords[1][1] - rcoords[0][1]])
-        else:
-            axis_vec = np.array([rcoords[2][0] - rcoords[1][0], rcoords[2][1] - rcoords[1][1]])
-        norm = np.linalg.norm(axis_vec)
-        if norm > 0:
-            axis_vec = axis_vec / norm
-            proj = pts @ axis_vec
-            center_proj = float(proj.mean())
-            factor = max_aspect_ratio / ratio
-            proj_new = center_proj + (proj - center_proj) * factor
-            perp = np.array([-axis_vec[1], axis_vec[0]])
-            proj_perp = pts @ perp
-            pts = np.outer(proj_new, axis_vec) + np.outer(proj_perp, perp)
-            poly = Polygon(pts)
-            if not poly.is_valid or poly.area <= 0.0:
-                raise ValueError("Многоугольник невалиден после ограничения отношения сторон.")
+        pts = _squeeze_along_long_axis(pts, ratio, max_aspect_ratio)
+        poly = Polygon(pts)
+        if not poly.is_valid or poly.area <= 0.0 or not poly.is_simple:
+            raise ValueError("Многоугольник невалиден после ограничения отношения сторон.")
 
     # поворот контура
     if rotation_deg != 0.0:
         poly = rotate(poly, rotation_deg, origin=(0.0, 0.0), use_radians=False)
 
-    # масштабирование до целевой площади относительно центра
+    # масштабирование до целевой площади относительно центроида
     factor = math.sqrt(target_area_m2 / poly.area)
     cx, cy = poly.centroid.x, poly.centroid.y
     pts = np.array(poly.exterior.coords)[:-1]
     pts_scaled = (pts - np.array([cx, cy])) * factor + np.array([cx, cy])
     poly = Polygon(pts_scaled)
-    if not poly.is_valid or poly.area <= 0.0:
+
+    # Итоговая проверка всех геометрических инвариантов. Поворот и изотропное
+    # масштабирование формально сохраняют отношение сторон, но из-за дискретизации
+    # ориентированного прямоугольника возможны малые отклонения — при превышении
+    # допуска выполняется одна корректирующая проекция, иначе форма отклоняется.
+    _AREA_REL_TOL = 1e-9
+    _RATIO_ABS_TOL = 1e-6
+    if not poly.is_valid or poly.area <= 0.0 or not poly.is_simple:
         raise ValueError("Многоугольник невалиден после масштабирования.")
+    if abs(poly.area - target_area_m2) > _AREA_REL_TOL * target_area_m2:
+        raise ValueError("Площадь многоугольника не соответствует целевой после масштабирования.")
     if len(poly.exterior.coords) - 1 != vertex_count:
         raise ValueError("Число вершин изменилось при построении формы.")
+    final_ratio = polygon_aspect_ratio(poly)
+    if final_ratio > max_aspect_ratio + _RATIO_ABS_TOL:
+        pts = np.array(poly.exterior.coords)[:-1]
+        pts = _squeeze_along_long_axis(pts, final_ratio, max_aspect_ratio)
+        poly = Polygon(pts)
+        if not poly.is_valid or poly.area <= 0.0 or not poly.is_simple:
+            raise ValueError("Многоугольник невалиден после коррекции отношения сторон.")
+        if len(poly.exterior.coords) - 1 != vertex_count:
+            raise ValueError("Число вершин изменилось при коррекции отношения сторон.")
+        # корректировка меняет площадь и отношение сторон — повторная нормировка и контроль
+        factor = math.sqrt(target_area_m2 / poly.area)
+        cx, cy = poly.centroid.x, poly.centroid.y
+        pts = np.array(poly.exterior.coords)[:-1]
+        poly = Polygon((pts - np.array([cx, cy])) * factor + np.array([cx, cy]))
+        if not poly.is_valid or poly.area <= 0.0 or not poly.is_simple:
+            raise ValueError("Многоугольник невалиден после повторной нормировки.")
+        final_ratio = polygon_aspect_ratio(poly)
+        if final_ratio > max_aspect_ratio + _RATIO_ABS_TOL:
+            raise ValueError(
+                f"Не удалось уложить отношение сторон {final_ratio:.6g} в предел {max_aspect_ratio}."
+            )
+        if abs(poly.area - target_area_m2) > _AREA_REL_TOL * target_area_m2:
+            raise ValueError("Площадь многоугольника не соответствует целевой после коррекции.")
+        if len(poly.exterior.coords) - 1 != vertex_count:
+            raise ValueError("Число вершин изменилось при финальной коррекции формы.")
     return poly
 
 

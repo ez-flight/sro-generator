@@ -7,6 +7,7 @@ from pathlib import Path
 
 from shapely.geometry import mapping
 
+from . import __version__
 from .generator import Scenario
 
 
@@ -98,11 +99,16 @@ def export_scenario(scenario: Scenario, output_dir: str | Path) -> dict[str, Pat
 
     # generation_report.json
     report = {
+        "version": __version__,
         "name": cfg.name,
         "seed": cfg.seed,
         "objects_created": len(scenario.objects),
         "frames_created": len(scenario.frames),
         "placement_attempts_total": scenario.report.attempts_total,
+        "placement_exact_checks_total": scenario.report.exact_checks_total,
+        "placement_tree_queries": scenario.report.tree_queries,
+        "placement_tree_rebuilds": scenario.report.tree_rebuilds,
+        "center_region_area_mean_m2": scenario.report.center_region_area_mean_m2,
         "warnings": scenario.warnings,
         "checks": {
             "count_matches_config": len(scenario.objects) == cfg.objects.count,
