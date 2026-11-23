@@ -3,9 +3,17 @@
 Исследуемый алгоритм — рандомизированный жадный отбор кадров-кандидатов. На каждой
 итерации k для каждого ещё не выбранного кадра вычисляется точный прирост полноты
 покрытия при добавлении его к объединению уже выбранных кадров (перекрытия в
-объединении не считаются дважды), и один кадр выбирается softmax-правилом с
-температурой: вес кадра ∝ exp(ΔI / (T·ΔI_max)). При T → 0 алгоритм становится
-чисто жадным, при T → ∞ — равномерно случайным.
+объединении не считаются дважды), и один кадр выбирается по одному из правил
+(``ConvergenceParams.selection``):
+
+- ``softmax`` — взвешенный случайный выбор с температурой: вес кадра
+  ∝ exp(ΔI / (T·ΔI_max)); при T → 0 алгоритм становится чисто жадным,
+  при T → ∞ — равномерно случайным (правило по умолчанию);
+- ``greedy`` — детерминированный выбор кадра с максимальным приростом
+  (при равенстве — первый по порядку; RNG не используется, все эксперименты
+  на одном сценарии дают одинаковую траекторию);
+- ``random`` — равномерный случайный выбор из оставшихся кадров (RNG, приросты
+  не вычисляются — кадры не ранжируются).
 
 Полнота информации после k итераций:
 
@@ -69,7 +77,9 @@ __all__ = [
     "ConvergenceParams",
     "run_convergence_study", "run_experiment",
     "compute_iteration_stats", "diagnose_convergence",
-    "write_convergence_csv", "write_convergence_json", "render_convergence_charts",
+    "coverage_threshold_analysis", "std_trend_analysis",
+    "write_convergence_csv", "write_convergence_json",
+    "render_convergence_charts", "render_comparison_charts",
 ]
 
 # t-критические значения уровня 0.975 распределения Стьюдента для df = 1…30
@@ -104,7 +114,11 @@ class ConvergenceParams:
       ``stabilization_tol`` и это выполняется до конца K;
     - ``min_completeness`` — минимально требуемая полнота информации;
     - ``temperature`` — температура softmax рандомизированного жадного выбора
-      (случайность исследуемого алгоритма);
+      (случайность исследуемого алгоритма; используется только при
+      ``selection = "softmax"``);
+    - ``selection`` — правило выбора кадра: ``"softmax"`` (по умолчанию),
+      ``"greedy"`` (детерминированный жадный) или ``"random"`` (равномерный
+      случайный без ранжирования приростов);
     - ``spread_tol`` — порог итогового std между экспериментами для диагностики
       разных локальных решений.
     """
@@ -116,6 +130,7 @@ class ConvergenceParams:
     stabilization_window: int = 3
     min_completeness: float = 0.9
     temperature: float = 0.25
+    selection: str = "softmax"
     spread_tol: float = 0.02
 
     def __post_init__(self) -> None:
@@ -132,6 +147,8 @@ class ConvergenceParams:
             raise ValueError("convergence.min_completeness: полнота информации — доля от 0 до 1.")
         if self.temperature <= 0.0:
             raise ValueError("convergence.temperature: температура должна быть положительной.")
+        if self.selection not in ("softmax", "greedy", "random"):
+            raise ValueError("convergence.selection: допустимые значения «softmax», «greedy» и «random».")
         if self.spread_tol < 0.0:
             raise ValueError("convergence.spread_tol: порог разброса не может быть отрицательным.")
 
@@ -169,6 +186,12 @@ def _scenario_fingerprint(scenario) -> dict:
         "first_vertex_x": round(float(first[0]), 3),
         "first_vertex_y": round(float(first[1]), 3),
     }
+
+
+def _cov_fraction(union: BaseGeometry, total: float) -> float:
+    """Доля покрытия с отсечением машинного шума пересечений/объединений к диапазону [0, 1]."""
+    v = union.area / total
+    return min(max(v, 0.0), 1.0)
 
 
 def run_experiment(
@@ -216,37 +239,41 @@ def run_experiment(
     for _ in range(params.iterations):
         if not remaining:  # кадры исчерпаны: полнота не меняется, итерации досчитываются
             trajectory.append(current)
-            district_cov.append(union_district.area / district_area)
-            objects_cov.append(union_objects.area / objects_area)
+            district_cov.append(_cov_fraction(union_district, district_area))
+            objects_cov.append(_cov_fraction(union_objects, objects_area))
             frames_selected.append("")
             marginal_gains.append(0.0)
             continue
 
-        gains: list[float] = []
-        for idx in remaining:
-            inter_d = cand_district[idx].intersection(union_district).area if not union_district.is_empty else 0.0
-            inter_o = cand_objects[idx].intersection(union_objects).area if not union_objects.is_empty else 0.0
-            gain = 0.5 * (
-                (area_district[idx] - inter_d) / district_area
-                + (area_objects[idx] - inter_o) / objects_area
-            )
-            gains.append(max(gain, 0.0))  # защита от численного шума
+        if params.selection == "random":
+            # равномерный случайный выбор без ранжирования приростов
+            pos = int(rng.integers(len(remaining)))
+        else:
+            gains: list[float] = []
+            for idx in remaining:
+                inter_d = cand_district[idx].intersection(union_district).area if not union_district.is_empty else 0.0
+                inter_o = cand_objects[idx].intersection(union_objects).area if not union_objects.is_empty else 0.0
+                gain = 0.5 * (
+                    (area_district[idx] - inter_d) / district_area
+                    + (area_objects[idx] - inter_o) / objects_area
+                )
+                gains.append(max(gain, 0.0))  # защита от численного шума
+            if params.selection == "greedy":
+                pos = int(np.argmax(np.asarray(gains)))  # при равенстве — первый по порядку (детерминированно)
+            else:
+                pos = _softmax_pick(gains, params.temperature, rng)
 
-        pos = _softmax_pick(gains, params.temperature, rng)
         idx = remaining.pop(pos)
+        previous = current
         union_district = union_district.union(cand_district[idx]) if not union_district.is_empty else cand_district[idx]
         union_objects = union_objects.union(cand_objects[idx]) if not union_objects.is_empty else cand_objects[idx]
+        current = 0.5 * (_cov_fraction(union_district, district_area) + _cov_fraction(union_objects, objects_area))
 
-        def _cov(union: BaseGeometry, total: float) -> float:
-            v = union.area / total
-            return min(max(v, 0.0), 1.0)  # машинный шум пересечений/объединений не должен выходить за [0, 1]
-
-        current = 0.5 * (_cov(union_district, district_area) + _cov(union_objects, objects_area))
         trajectory.append(current)
-        district_cov.append(_cov(union_district, district_area))
-        objects_cov.append(_cov(union_objects, objects_area))
+        district_cov.append(_cov_fraction(union_district, district_area))
+        objects_cov.append(_cov_fraction(union_objects, objects_area))
         frames_selected.append(scenario.frames[idx].frame_id)
-        marginal_gains.append(gains[pos])
+        marginal_gains.append(current - previous)
 
     return {
         "experiment": experiment_index,
@@ -390,6 +417,140 @@ def diagnose_convergence(iteration_stats: list[dict], params: ConvergenceParams)
         "verdict": verdict,
         "verdict_ru": _VERDICTS_RU[verdict],
         "detail": detail,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Анализ достижимости порогов покрытия и тренда разброса
+# ---------------------------------------------------------------------------
+
+def coverage_threshold_analysis(
+    study: dict | list[list[float]],
+    thresholds: tuple[float, ...] = (0.90, 0.95, 0.99),
+    confidence: float = 0.95,
+) -> list[dict]:
+    """Определить, на какой итерации порог покрытия достигается с заданной вероятностью.
+
+    Для порога γ вероятность достижения на итерации k оценивается долей
+    экспериментов с I_m(k) ≥ γ; k_дов = первое k, где доля ≥ ``confidence``.
+    Если такого k нет (потолок покрытия ниже порога у > 5 % экспериментов),
+    k_дов = None — порог недостижим с требуемой вероятностью. Доля достижения
+    сопровождается нормальным 95%-м интервалом (Clopper–Pearson не требуется
+    при M = 100: np(1−p) ≥ 5 при p ∈ [0.05, 0.95]).
+    """
+    if not (0.0 < confidence < 1.0):
+        raise ValueError("coverage_threshold_analysis: confidence должно быть в (0, 1).")
+    if isinstance(study, dict):
+        trajectories = [e["trajectory"] for e in study["experiments"]]
+    else:
+        trajectories = study
+    arr = np.asarray(trajectories, dtype=float)
+    if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] == 0:
+        raise ValueError("coverage_threshold_analysis: ожидаются непустые траектории (M, K).")
+    m_total, k_total = arr.shape
+    z = 1.96
+    results: list[dict] = []
+    for gamma in thresholds:
+        reached = arr >= gamma
+        share = reached.mean(axis=0)
+        ks_conf = np.nonzero(share >= confidence)[0]
+        first_hits: list[int | None] = []
+        for m in range(m_total):
+            idx = np.nonzero(reached[m])[0]
+            first_hits.append(int(idx[0]) + 1 if idx.size else None)
+        finite = [h for h in first_hits if h is not None]
+        share_final = float(share[-1])
+        half = z * math.sqrt(share_final * (1.0 - share_final) / m_total)
+        results.append({
+            "threshold": gamma,
+            "confidence": confidence,
+            "k_confidence": (int(ks_conf[0]) + 1) if ks_conf.size else None,
+            "reach_share_final": share_final,
+            "reach_share_final_ci95_low": max(0.0, share_final - half),
+            "reach_share_final_ci95_high": min(1.0, share_final + half),
+            "experiments_reached": len(finite),
+            "experiments_total": m_total,
+            "k_min_first_reach": min(finite) if finite else None,
+            "k_median_first_reach": (float(np.median(finite)) if finite else None),
+            "k_max_first_reach": max(finite) if finite else None,
+            "share_by_iteration": [float(v) for v in share],
+        })
+    return results
+
+
+def _ranks(values: np.ndarray) -> np.ndarray:
+    """Ранги значений (средние ранги при совпадениях), без внешних зависимостей."""
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(len(values), dtype=float)
+    ranks[order] = np.arange(len(values), dtype=float)
+    sorted_v = values[order]
+    i = 0
+    while i < len(sorted_v):
+        j = i
+        while j + 1 < len(sorted_v) and sorted_v[j + 1] == sorted_v[i]:
+            j += 1
+        if j > i:
+            ranks[order[i:j + 1]] = 0.5 * (i + j)
+        i = j + 1
+    return ranks
+
+
+def _spearman_rho(x: np.ndarray, y: np.ndarray) -> float:
+    """ρ Спирмена между двумя рядами (ранговая корреляция, без scipy).
+
+    Константный ряд (нуловая дисперсия рангов) даёт ρ = 0 — ассоциации нет.
+    """
+    n = len(x)
+    if n < 3:
+        return math.nan
+    rx = _ranks(np.asarray(x, dtype=float))
+    ry = _ranks(np.asarray(y, dtype=float))
+    if rx[0] == rx[-1] or ry[0] == ry[-1]:
+        return 0.0
+    d = rx - ry
+    return 1.0 - 6.0 * float((d * d).sum()) / (n * (n * n - 1))
+
+
+def std_trend_analysis(
+    iteration_stats: list[dict],
+    n_perm: int = 10000,
+    seed: int = 20261124,
+) -> dict:
+    """Проверить по фактическим результатам, убывает ли разброс между экспериментами.
+
+    ρ Спирмена между номером итерации k и std(k); значимость — перестановочный
+    тест (n_perm перестановок std по k, фиксированный seed — воспроизводимо).
+    Гипотеза «разброс убывает» принимается при ρ < 0 и p < 0.05 — сходимость
+    заранее не предполагается: возможен и вывод об отсутствии убывания.
+    """
+    ks = np.asarray([s["iteration"] for s in iteration_stats], dtype=float)
+    stds = np.asarray([s["std"] for s in iteration_stats], dtype=float)
+    band = np.asarray([s["p90"] - s["p10"] for s in iteration_stats], dtype=float)
+    mask = ~np.isnan(stds)
+    ks, stds, band = ks[mask], stds[mask], band[mask]
+    if len(ks) < 3:
+        raise ValueError("std_trend_analysis: недостаточно точек со значимым std (M ≥ 2).")
+    rho = _spearman_rho(ks, stds)
+    rng = np.random.default_rng(seed)
+    count = 0
+    for _ in range(n_perm):
+        rp = _spearman_rho(ks, stds[rng.permutation(len(stds))])
+        if abs(rp) >= abs(rho):
+            count += 1
+    p_value = (count + 1) / (n_perm + 1)
+    head = float(stds[:10].mean())
+    tail = float(stds[-10:].mean())
+    return {
+        "n_points": int(len(ks)),
+        "spearman_rho_std": rho,
+        "permutation_p_value": p_value,
+        "decreasing_significant": bool(rho < 0.0 and p_value < 0.05),
+        "std_first10_mean": head,
+        "std_last10_mean": tail,
+        "std_ratio_last_first": (tail / head) if head > 0 else math.nan,
+        "band_spearman_rho": _spearman_rho(ks, band),
+        "n_perm": n_perm,
+        "seed": seed,
     }
 
 
@@ -575,14 +736,18 @@ def render_convergence_charts(study: dict, out_dir: str | Path) -> dict[str, Pat
     median = np.asarray([s["median"] for s in stats], dtype=float)
     p10 = np.asarray([s["p10"] for s in stats], dtype=float)
     p90 = np.asarray([s["p90"] for s in stats], dtype=float)
+    ci_lo = np.asarray([s["ci95_low"] for s in stats], dtype=float)
+    ci_hi = np.asarray([s["ci95_high"] for s in stats], dtype=float)
     std = np.asarray([s["std"] for s in stats], dtype=float)
     increments = np.asarray([s["mean_increment"] for s in stats], dtype=float)
     k_stab = conv["stabilized_at_iteration"]
 
-    # 1) Средняя полнота vs число итераций с полосой межэкспериментального разброса
+    # 1) Средняя полнота vs число итераций: полоса p10–p90 и 95%-й ДИ среднего
     fig, ax = plt.subplots(figsize=(9, 5.5))
     ax.fill_between(x, p10, p90, color=_COLOR_REAL, alpha=0.25,
                     label=f"разброс p10–p90 ({params['experiments']} экспериментов)")
+    ax.fill_between(x, ci_lo, ci_hi, color=_COLOR_REAL, alpha=0.45,
+                    label="95%-й ДИ среднего")
     ax.plot(x, mean, color=_COLOR_REAL, linewidth=2.0, marker="o", markersize=3.5,
             label="средняя полнота I(k)")
     ax.plot(x, median, color=_COLOR_ALT, linestyle="--", linewidth=1.2, label="медиана")
@@ -591,13 +756,14 @@ def render_convergence_charts(study: dict, out_dir: str | Path) -> dict[str, Pat
     if k_stab is not None:
         ax.axvline(k_stab, color=_COLOR_HIGHLIGHT, linestyle="--", linewidth=1.2,
                    label=f"стабилизация на k = {k_stab}")
-    ax.set_title(f"Сходимость алгоритма: {conv['verdict_ru']}")
+    ax.set_title(f"Средняя полнота I(k) vs число итераций — диагноз: {conv['verdict']}")
     ax.set_xlabel("число итераций k")
     ax.set_ylabel("полнота информации I(k)")
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=8, loc="lower right")
+    fig.text(0.01, 0.02, conv["verdict_ru"] + ".", fontsize=8, alpha=0.75)
     fig.text(0.01, 0.005,
-             "Полоса — фактические p10–p90 по экспериментам на каждой итерации; сглаживание не применяется.",
+             "Полосы — фактические p10–p90 и 95%-й ДИ среднего по экспериментам на каждой итерации; сглаживание не применяется.",
              fontsize=7, alpha=0.7)
     fig.tight_layout()
     p = out / "convergence_mean_spread.png"
@@ -663,5 +829,95 @@ def render_convergence_charts(study: dict, out_dir: str | Path) -> dict[str, Pat
     fig.savefig(p, dpi=150)
     plt.close(fig)
     paths["convergence_increments.png"] = p
+
+    return paths
+
+
+def render_comparison_charts(studies: list[tuple[str, dict]], out_dir: str | Path) -> dict[str, Path]:
+    """Сравнение исследований (метка, study): кривые средней полноты и std, сводные метрики.
+
+    Кривые — фактические средние и std по итерациям каждого исследования,
+    сглаживание не применяется.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, Path] = {}
+    if not studies:
+        return paths
+
+    colors = plt.cm.tab10.colors
+
+    # 1) Кривые средней полноты и разброса
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(14, 5.5))
+    for i, (label, study) in enumerate(studies):
+        stats = study["iteration_stats"]
+        x = np.asarray([s["iteration"] for s in stats], dtype=float)
+        mean = np.asarray([s["mean"] for s in stats], dtype=float)
+        std = np.asarray([s["std"] for s in stats], dtype=float)
+        c = colors[i % 10]
+        a1.plot(x, mean, color=c, linewidth=1.8, label=label)
+        a2.plot(x, std, color=c, linewidth=1.8, label=label)
+    min_comp = studies[0][1]["params"]["min_completeness"]
+    for ax, ylabel in ((a1, "средняя полнота I(k)"), (a2, "std между экспериментами")):
+        ax.set_xlabel("число итераций k")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8)
+    a1.axhline(min_comp, color=_COLOR_TARGET, linestyle=":", linewidth=1.2,
+               label=f"требуемая полнота {min_comp:.3g}")
+    a1.set_title("Средняя полнота информации vs число итераций")
+    a2.set_title("Стандартное отклонение между экспериментами")
+    fig.tight_layout()
+    p = out / "convergence_comparison_curves.png"
+    fig.savefig(p, dpi=150)
+    plt.close(fig)
+    paths["convergence_comparison_curves.png"] = p
+
+    # 2) Сводные метрики: итоговая полнота (±95% ДИ), итоговый std, AUC средней кривой, k стабилизации
+    labels = [s[0] for s in studies]
+    finals_mean = [s[1]["iteration_stats"][-1]["mean"] for s in studies]
+    finals_ci = []
+    for _, study in studies:
+        s = study["iteration_stats"][-1]
+        finals_ci.append((s["ci95_high"] - s["ci95_low"]) / 2.0)
+    finals_std = [s[1]["iteration_stats"][-1]["std"] for s in studies]
+    aucs = []
+    for _, study in studies:
+        stats = study["iteration_stats"]
+        mean = np.asarray([s["mean"] for s in stats], dtype=float)
+        trapezoid = getattr(np, "trapezoid", None) or np.trapz  # numpy >= 2.0 / < 2.0
+        aucs.append(float(trapezoid(mean, dx=1.0) / len(mean)))
+    k_stabs = [s[1]["convergence"]["stabilized_at_iteration"] or 0 for s in studies]
+
+    fig, axes = plt.subplots(1, 4, figsize=(18, 4.8))
+    xpos = np.arange(len(labels))
+    for ax, values, title in (
+        (axes[0], finals_mean, "Итоговая средняя полнота I(K)"),
+        (axes[1], finals_std, "Итоговый std между экспериментами"),
+        (axes[2], aucs, "AUC средней кривой (скорость роста)"),
+        (axes[3], k_stabs, "Итерация стабилизации k*"),
+    ):
+        bars = ax.bar(xpos, values, color=[colors[i % 10] for i in range(len(labels))],
+                      edgecolor="black")
+        if title.startswith("Итоговая средняя"):
+            ax.errorbar(xpos, values, yerr=finals_ci, fmt="none", ecolor="black", capsize=3)
+        for bar, v in zip(bars, values):
+            ax.annotate(f"{v:.4g}" if v < 10 else f"{v:.0f}",
+                        (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                        ha="center", va="bottom", fontsize=8)
+        ax.set_xticks(xpos)
+        ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=8)
+        ax.set_title(title, fontsize=10)
+        ax.grid(True, alpha=0.3, axis="y")
+    fig.tight_layout()
+    p = out / "convergence_comparison_summary.png"
+    fig.savefig(p, dpi=150)
+    plt.close(fig)
+    paths["convergence_comparison_summary.png"] = p
 
     return paths

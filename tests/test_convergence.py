@@ -13,9 +13,13 @@ from sro_generator.config import ConfigError, ScenarioConfig
 from sro_generator.convergence import (
     ConvergenceParams,
     compute_iteration_stats,
+    coverage_threshold_analysis,
     diagnose_convergence,
+    render_comparison_charts,
     render_convergence_charts,
     run_convergence_study,
+    run_experiment,
+    std_trend_analysis,
     write_convergence_csv,
     write_convergence_json,
 )
@@ -266,3 +270,121 @@ class TestExports:
                      "convergence_trajectories.png", "convergence_increments.png"):
             assert name in chart_paths
             assert chart_paths[name].stat().st_size > 0
+
+
+class TestSelectionModes:
+    def test_greedy_is_deterministic(self):
+        cfg = make_config()
+        params = ConvergenceParams(experiments=2, iterations=6, seed_start=100, selection="greedy")
+        a = run_experiment(cfg, params, algo_seed=1, experiment_index=0)
+        b = run_experiment(cfg, params, algo_seed=999, experiment_index=1)
+        assert a["trajectory"] == b["trajectory"]
+
+    def test_random_differs_across_seeds(self):
+        cfg = make_config()
+        params = ConvergenceParams(experiments=2, iterations=6, seed_start=100, selection="random")
+        a = run_experiment(cfg, params, algo_seed=1, experiment_index=0)
+        b = run_experiment(cfg, params, algo_seed=2, experiment_index=1)
+        assert a["trajectory"] != b["trajectory"]
+        # приросты во всех режимах — фактическая разность траектории
+        for k in range(1, 6):
+            assert abs(a["marginal_gains"][k] - (a["trajectory"][k] - a["trajectory"][k - 1])) < 1e-12
+
+    def test_greedy_not_worse_than_random_on_average(self):
+        cfg = make_config()
+        final = {}
+        for selection in ("greedy", "random"):
+            study = run_convergence_study(
+                cfg, ConvergenceParams(experiments=6, iterations=8, seed_start=100, selection=selection),
+                workers=1,
+            )
+            final[selection] = study["iteration_stats"][-1]["mean"]
+        assert final["greedy"] >= final["random"]
+
+    def test_invalid_selection(self):
+        with pytest.raises(ValueError):
+            ConvergenceParams(selection="genetic")
+
+
+class TestThresholdAnalysis:
+    def test_known_k_confidence(self):
+        # 4 эксперимента: порог 0.5 достигается к k=4 у всех, к k=2 — у двоих
+        trajectories = [
+            [0.1, 0.3, 0.6, 0.7],
+            [0.1, 0.55, 0.6, 0.7],
+            [0.2, 0.3, 0.55, 0.7],
+            [0.2, 0.6, 0.65, 0.7],
+        ]
+        res = coverage_threshold_analysis(trajectories, thresholds=(0.5,), confidence=0.95)
+        assert len(res) == 1
+        r = res[0]
+        assert r["k_confidence"] == 3          # доли: k=1 → 0, k=2 → 0.5, k=3 → 1.0 ≥ 0.95
+        assert r["reach_share_final"] == 1.0
+        assert r["k_median_first_reach"] == 2.5  # первые попадания: 3, 2, 3, 2
+        assert r["experiments_reached"] == 4
+        assert len(r["share_by_iteration"]) == 4
+
+    def test_unreachable_threshold(self):
+        trajectories = [[0.1, 0.2, 0.3], [0.1, 0.2, 0.3], [0.1, 0.2, 0.3]]
+        r = coverage_threshold_analysis(trajectories, thresholds=(0.9,), confidence=0.95)[0]
+        assert r["k_confidence"] is None
+        assert r["k_median_first_reach"] is None
+        assert r["experiments_reached"] == 0
+        assert r["reach_share_final"] == 0.0
+
+    def test_ci_contains_share(self, study):
+        for r in coverage_threshold_analysis(study, thresholds=(0.5, 0.9)):
+            assert r["reach_share_final_ci95_low"] <= r["reach_share_final"] <= r["reach_share_final_ci95_high"]
+            assert 0.0 <= r["reach_share_final_ci95_low"] <= 1.0
+
+    def test_bad_confidence(self):
+        with pytest.raises(ValueError):
+            coverage_threshold_analysis([[0.1]], confidence=1.5)
+
+
+class TestStdTrendAnalysis:
+    def _stats_with_std(self, stds):
+        return [
+            {
+                "iteration": i + 1, "mean": 0.5, "std": s, "median": 0.5,
+                "p10": 0.5 - s, "p90": 0.5 + s,
+                "ci95_low": 0.4, "ci95_high": 0.6, "mean_increment": 0.01,
+            }
+            for i, s in enumerate(stds)
+        ]
+
+    def test_decreasing_trend_detected(self):
+        stds = [0.10, 0.09, 0.085, 0.08, 0.07, 0.06, 0.05, 0.04, 0.03, 0.02,
+                0.015, 0.01, 0.008, 0.005, 0.003, 0.002, 0.0015, 0.001, 0.0005, 0.0002]
+        res = std_trend_analysis(self._stats_with_std(stds), n_perm=2000)
+        assert res["spearman_rho_std"] < -0.9
+        assert res["decreasing_significant"]
+        assert res["std_ratio_last_first"] < 0.5
+
+    def test_constant_std_is_no_trend(self):
+        res = std_trend_analysis(self._stats_with_std([0.01] * 12), n_perm=500)
+        assert res["spearman_rho_std"] == 0.0
+        assert not res["decreasing_significant"]
+        assert res["permutation_p_value"] == 1.0
+
+    def test_greedy_study_zero_std(self):
+        cfg = make_config()
+        study = run_convergence_study(
+            cfg, ConvergenceParams(experiments=2, iterations=6, selection="greedy"), workers=1,
+        )
+        assert all(s["std"] == 0.0 for s in study["iteration_stats"])
+        res = std_trend_analysis(study["iteration_stats"], n_perm=500)
+        assert not res["decreasing_significant"]
+
+
+class TestComparisonCharts:
+    def test_comparison_charts_written(self, study, tmp_path):
+        other = run_convergence_study(
+            make_config(),
+            ConvergenceParams(experiments=4, iterations=8, seed_start=100, selection="random"),
+            workers=1,
+        )
+        paths = render_comparison_charts([("softmax T=0.25", study), ("random", other)], tmp_path)
+        assert set(paths) == {"convergence_comparison_curves.png", "convergence_comparison_summary.png"}
+        for p in paths.values():
+            assert p.stat().st_size > 0
