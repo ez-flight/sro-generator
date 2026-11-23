@@ -3,6 +3,8 @@
 Одиночный прогон: кнопка «Сгенерировать».
 Серия прогонов: задайте число прогонов и потоков — прогоны выполняются
 параллельно (seed = базовый … базовый + N − 1) и сводятся в статистику.
+Исследование сходимости: M независимых экспериментов × K итераций
+итерационного алгоритма формирования кадров на фиксированном сценарии.
 
 Запуск: streamlit run app.py
 """
@@ -17,6 +19,13 @@ import pandas as pd
 import streamlit as st
 
 from sro_generator.config import ConfigError, ScenarioConfig
+from sro_generator.convergence import (
+    ConvergenceParams,
+    render_convergence_charts,
+    run_convergence_study,
+    write_convergence_csv,
+    write_convergence_json,
+)
 from sro_generator.export import render_preview
 from sro_generator.generator import generate_scenario
 from sro_generator.placement import PlacementError
@@ -89,16 +98,6 @@ with st.sidebar:
         min_value=1, max_value=32, step=1,
     )
 
-st.subheader("Ручные центры (пусто — полностью случайное размещение)")
-centers_df = st.data_editor(
-    pd.DataFrame(columns=["object_id", "latitude", "longitude"]),
-    num_rows="dynamic",
-    key="manual_centers",
-)
-
-show_frames = st.checkbox("Показывать кадры на рисунке", value=True) if frames_enabled else False
-show_labels = st.checkbox("Подписи object_id", value=True)
-
 
 def parse_manual_centers(df) -> tuple[list[dict], list[str]]:
     """Разобрать таблицу ручных центров; вернуть (центры, ошибки)."""
@@ -168,103 +167,6 @@ def build_config(manual_centers: list[dict]) -> dict:
             "pass_azimuths_deg": [float(a) for a in azimuths.split(",") if a.strip()] if frames_enabled else [],
         },
     }
-
-
-if st.button("Сгенерировать", type="primary"):
-    manual_centers, errors = parse_manual_centers(centers_df)
-    if errors:
-        for e in errors:
-            st.error(e)
-        st.stop()
-
-    config_dict = build_config(manual_centers)
-    try:
-        config = ScenarioConfig.model_validate(config_dict)
-    except ConfigError as exc:
-        st.error(f"Ошибка конфигурации: {exc}")
-        st.stop()
-
-    with st.spinner("Генерация…"):
-        try:
-            scenario = generate_scenario(config)
-        except PlacementError as exc:
-            st.error(f"Ошибка размещения: {exc}")
-            st.stop()
-
-    preview_path = render_preview(scenario, "/tmp/sro_preview.png", show_frames=show_frames, labels=show_labels)
-    col_l, col_r = st.columns([3, 2])
-    with col_l:
-        st.image(str(preview_path), caption=f"Район «{config.name}», seed={config.seed}")
-
-    areas = [o.area_m2 for o in scenario.objects]
-    manual_share = sum(1 for o in scenario.objects if o.coordinate_fixed) / len(scenario.objects)
-    with col_r:
-        st.subheader("Сводка")
-        st.metric("Число объектов", len(scenario.objects))
-        st.metric("Кадров", len(scenario.frames))
-        st.metric("Площадь объектов, м²", f"{min(areas):,.0f} – {max(areas):,.0f}")
-        st.metric("Вершин (мин–макс)", f"{min(o.vertex_count for o in scenario.objects)} – {max(o.vertex_count for o in scenario.objects)}")
-        st.metric("Доля ручных центров", f"{manual_share:.0%}")
-        st.metric("Попыток размещения", scenario.report.attempts_total)
-        for w in scenario.warnings:
-            st.warning(w)
-
-    st.subheader("Атрибуты объектов")
-    st.dataframe(pd.DataFrame([
-        {
-            "object_id": o.object_id,
-            "class_label": o.class_label,
-            "area_m2": round(o.area_m2, 1),
-            "vertex_count": o.vertex_count,
-            "priority": o.priority,
-            "deadline_h": o.deadline_h,
-            "resolution_m": o.resolution_m,
-            "placement_mode": o.placement_mode,
-            "coordinate_fixed": o.coordinate_fixed,
-            "center_lat": round(scenario.local.to_lonlat(o.center.x, o.center.y)[1], 6),
-            "center_lon": round(scenario.local.to_lonlat(o.center.x, o.center.y)[0], 6),
-        }
-        for o in scenario.objects
-    ]))
-
-    buf = io.BytesIO()
-    with open(preview_path, "rb") as f:
-        buf.write(f.read())
-    st.download_button("Скачать preview.png", buf.getvalue(), file_name="preview.png", mime="image/png")
-    st.session_state["scenario"] = scenario
-
-st.divider()
-st.subheader("Серия прогонов для анализа и статистики")
-st.caption(
-    f"Каждый прогон — независимая генерация со своим seed "
-    f"({int(seed)} … {int(seed) + int(n_runs) - 1}). Прогоны идут параллельно в {int(workers)} поток(ах); "
-    "упавшие прогоны фиксируются и не прерывают серию."
-)
-
-if st.button(f"Запустить серию: {int(n_runs)} прогонов", type="primary"):
-    manual_centers, errors = parse_manual_centers(centers_df)
-    if errors:
-        for e in errors:
-            st.error(e)
-        st.stop()
-    config_dict = build_config(manual_centers)
-    try:
-        ScenarioConfig.model_validate(config_dict)
-    except ConfigError as exc:
-        st.error(f"Ошибка конфигурации: {exc}")
-        st.stop()
-
-    progress = st.progress(0.0, text="Серия прогонов…")
-    batch = run_batch(
-        config_dict,
-        n_runs=int(n_runs),
-        workers=int(workers),
-        seed_start=int(seed),
-        progress=lambda done, total: progress.progress(done / total, text=f"Прогонов завершено: {done}/{total}"),
-    )
-    progress.empty()
-    st.session_state["batch"] = batch
-    st.session_state["batch_dir"] = tempfile.mkdtemp(prefix="sro_batch_")
 
 
 def render_batch(batch: dict, out_dir: str) -> None:
@@ -361,6 +263,278 @@ def render_batch(batch: dict, out_dir: str) -> None:
             st.info("Ошибок нет — все прогоны завершились успешно.")
 
 
-batch = st.session_state.get("batch")
-if batch:
-    render_batch(batch, st.session_state.get("batch_dir") or tempfile.mkdtemp(prefix="sro_batch_"))
+_VERDICT_TO_MESSAGE = {
+    "converged": st.success,
+    "stagnation": st.warning,
+    "different_local_optima": st.warning,
+    "no_convergence": st.error,
+}
+
+
+def render_convergence(study: dict, out_dir: str) -> None:
+    """Показать результаты исследования сходимости: диагноз, метрики, графики, таблицы, выгрузки."""
+    c = study["convergence"]
+    params = study["params"]
+    _VERDICT_TO_MESSAGE[c["verdict"]](c["verdict_ru"] + ".")
+    st.caption(c["detail"])
+    for w in study.get("warnings", []):
+        st.warning(w)
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Итоговая средняя полнота", f"{c['final_mean']:.4f}")
+    m2.metric("Итоговое std между экспериментами", f"{c['final_std']:.4f}")
+    m3.metric("Разброс p10–p90 (на K)", f"{c['final_band_p10_p90']:.4f}")
+    m4.metric("Стабилизировалось",
+              f"на k = {c['stabilized_at_iteration']}" if c["stabilized_at_iteration"] else "нет")
+    m5.metric("Экспериментов × итераций", f"{params['experiments']} × {params['iterations']}")
+
+    tab_summary, tab_exp, tab_files = st.tabs(["Сводка по итерациям", "Эксперименты", "CSV / JSON / PNG"])
+
+    chart_paths = render_convergence_charts(study, out_dir)
+    csv_paths = write_convergence_csv(study, out_dir)
+    json_path = write_convergence_json(study, out_dir)
+
+    with tab_summary:
+        st.dataframe(pd.DataFrame([
+            {
+                "k": s["iteration"],
+                "среднее": round(s["mean"], 6),
+                "std": round(s["std"], 6),
+                "медиана": round(s["median"], 6),
+                "p10": round(s["p10"], 6),
+                "p90": round(s["p90"], 6),
+                "ДИ95 нижн.": round(s["ci95_low"], 6),
+                "ДИ95 верхн.": round(s["ci95_high"], 6),
+                "средний прирост": round(s["mean_increment"], 6),
+            }
+            for s in study["iteration_stats"]
+        ]))
+        st.caption(
+            "Статистики по фактическим результатам M независимых экспериментов на каждой итерации; "
+            "std — ddof=1, доверительный интервал среднего — 95%-й (t-критическое). "
+            "Полнота I(k) = 0.5·(покрытие района ∪ кадров + покрытие объектов ∪ кадров), "
+            "перекрытия в объединении не считаются дважды."
+        )
+        for p in chart_paths.values():
+            st.image(str(p))
+
+    with tab_exp:
+        st.dataframe(pd.DataFrame([
+            {
+                "эксперимент": e["experiment"],
+                "seed": e["seed"],
+                "итоговая полнота": round(e["final_completeness"], 6),
+                "время, с": round(e["duration_s"], 3),
+                "выбрано кадров": sum(1 for f in e["frames_selected"] if f),
+            }
+            for e in study["experiments"]
+        ]))
+        st.caption("Полная траектория I(k) каждого эксперимента — в convergence_trajectories.csv и convergence.json.")
+
+    with tab_files:
+        for name_csv, p in csv_paths.items():
+            with open(p, "rb") as f:
+                st.download_button(f"Скачать {name_csv}", f.read(), file_name=name_csv, mime="text/csv")
+        with open(json_path, "rb") as f:
+            st.download_button("Скачать convergence.json", f.read(), file_name="convergence.json",
+                               mime="application/json")
+        for name_png, p in chart_paths.items():
+            with open(p, "rb") as f:
+                st.download_button(f"Скачать {name_png}", f.read(), file_name=name_png, mime="image/png")
+        st.caption(
+            "convergence_trajectories.csv — полная траектория I(k) каждого эксперимента; "
+            "convergence_summary.csv — статистика по номерам итераций; "
+            "convergence_experiments.csv — итоги экспериментов; "
+            "convergence.json — всё исследование (параметры, траектории, диагноз)."
+        )
+
+
+tab_gen, tab_conv = st.tabs(["Генерация и серия", "Сходимость алгоритма"])
+
+with tab_gen:
+    st.subheader("Ручные центры (пусто — полностью случайное размещение)")
+    centers_df = st.data_editor(
+        pd.DataFrame(columns=["object_id", "latitude", "longitude"]),
+        num_rows="dynamic",
+        key="manual_centers",
+    )
+
+    show_frames = st.checkbox("Показывать кадры на рисунке", value=True) if frames_enabled else False
+    show_labels = st.checkbox("Подписи object_id", value=True)
+
+    if st.button("Сгенерировать", type="primary"):
+        manual_centers, errors = parse_manual_centers(centers_df)
+        if errors:
+            for e in errors:
+                st.error(e)
+            st.stop()
+
+        config_dict = build_config(manual_centers)
+        try:
+            config = ScenarioConfig.model_validate(config_dict)
+        except ConfigError as exc:
+            st.error(f"Ошибка конфигурации: {exc}")
+            st.stop()
+
+        with st.spinner("Генерация…"):
+            try:
+                scenario = generate_scenario(config)
+            except PlacementError as exc:
+                st.error(f"Ошибка размещения: {exc}")
+                st.stop()
+
+        preview_path = render_preview(scenario, "/tmp/sro_preview.png", show_frames=show_frames, labels=show_labels)
+        col_l, col_r = st.columns([3, 2])
+        with col_l:
+            st.image(str(preview_path), caption=f"Район «{config.name}», seed={config.seed}")
+
+        areas = [o.area_m2 for o in scenario.objects]
+        manual_share = sum(1 for o in scenario.objects if o.coordinate_fixed) / len(scenario.objects)
+        with col_r:
+            st.subheader("Сводка")
+            st.metric("Число объектов", len(scenario.objects))
+            st.metric("Кадров", len(scenario.frames))
+            st.metric("Площадь объектов, м²", f"{min(areas):,.0f} – {max(areas):,.0f}")
+            st.metric("Вершин (мин–макс)", f"{min(o.vertex_count for o in scenario.objects)} – {max(o.vertex_count for o in scenario.objects)}")
+            st.metric("Доля ручных центров", f"{manual_share:.0%}")
+            st.metric("Попыток размещения", scenario.report.attempts_total)
+            for w in scenario.warnings:
+                st.warning(w)
+
+        st.subheader("Атрибуты объектов")
+        st.dataframe(pd.DataFrame([
+            {
+                "object_id": o.object_id,
+                "class_label": o.class_label,
+                "area_m2": round(o.area_m2, 1),
+                "vertex_count": o.vertex_count,
+                "priority": o.priority,
+                "deadline_h": o.deadline_h,
+                "resolution_m": o.resolution_m,
+                "placement_mode": o.placement_mode,
+                "coordinate_fixed": o.coordinate_fixed,
+                "center_lat": round(scenario.local.to_lonlat(o.center.x, o.center.y)[1], 6),
+                "center_lon": round(scenario.local.to_lonlat(o.center.x, o.center.y)[0], 6),
+            }
+            for o in scenario.objects
+        ]))
+
+        buf = io.BytesIO()
+        with open(preview_path, "rb") as f:
+            buf.write(f.read())
+        st.download_button("Скачать preview.png", buf.getvalue(), file_name="preview.png", mime="image/png")
+        st.session_state["scenario"] = scenario
+
+    st.divider()
+    st.subheader("Серия прогонов для анализа и статистики")
+    st.caption(
+        f"Каждый прогон — независимая генерация со своим seed "
+        f"({int(seed)} … {int(seed) + int(n_runs) - 1}). Прогоны идут параллельно в {int(workers)} поток(ах); "
+        "упавшие прогоны фиксируются и не прерывают серию."
+    )
+
+    if st.button(f"Запустить серию: {int(n_runs)} прогонов", type="primary"):
+        manual_centers, errors = parse_manual_centers(centers_df)
+        if errors:
+            for e in errors:
+                st.error(e)
+            st.stop()
+        config_dict = build_config(manual_centers)
+        try:
+            ScenarioConfig.model_validate(config_dict)
+        except ConfigError as exc:
+            st.error(f"Ошибка конфигурации: {exc}")
+            st.stop()
+
+        progress = st.progress(0.0, text="Серия прогонов…")
+        batch = run_batch(
+            config_dict,
+            n_runs=int(n_runs),
+            workers=int(workers),
+            seed_start=int(seed),
+            progress=lambda done, total: progress.progress(done / total, text=f"Прогонов завершено: {done}/{total}"),
+        )
+        progress.empty()
+        st.session_state["batch"] = batch
+        st.session_state["batch_dir"] = tempfile.mkdtemp(prefix="sro_batch_")
+
+    batch = st.session_state.get("batch")
+    if batch:
+        render_batch(batch, st.session_state.get("batch_dir") or tempfile.mkdtemp(prefix="sro_batch_"))
+
+with tab_conv:
+    st.subheader("Исследование сходимости итерационного алгоритма формирования кадров РСА")
+    st.caption(
+        "Для фиксированного сценария (район, объекты и кадры-кандидаты неизменны — "
+        "случайность только в алгоритме) проводится M независимых экспериментов, "
+        "каждый содержит K последовательных итераций рандомизированного жадного отбора кадров. "
+        "После каждой итерации сохраняется полнота информации I(k) — покрытие района и объектов "
+        "объединением выбранных кадров без повторного счёта перекрытий."
+    )
+    cc1, cc2, cc3 = st.columns(3)
+    conv_m = cc1.number_input("Экспериментов M", value=20, min_value=2, max_value=500, step=5)
+    conv_k = cc2.number_input("Итераций K", value=30, min_value=1, max_value=500, step=5)
+    conv_seed = cc3.number_input("Начальный seed экспериментов", value=0, step=1)
+    cc4, cc5, cc6 = st.columns(3)
+    conv_tol = cc4.number_input("Критерий стабилизации: порог прироста", value=0.001, min_value=0.000001,
+                                format="%.6f")
+    conv_window = cc5.number_input("Критерий стабилизации: окно, итераций", value=3, min_value=1, step=1)
+    conv_min = cc6.number_input("Минимально требуемая полнота", value=0.9, min_value=0.0, max_value=1.0)
+    cc7, cc8 = st.columns(2)
+    conv_temp = cc7.number_input("Температура алгоритма", value=0.25, min_value=0.001, format="%.3f")
+    conv_workers = cc8.number_input(
+        "Параллельных потоков (исследование)",
+        value=min(4, os.cpu_count() or 1),
+        min_value=1, max_value=32, step=1,
+        key="conv_workers",
+    )
+
+    if st.button("Запустить исследование сходимости", type="primary"):
+        manual_centers, errors = parse_manual_centers(centers_df)
+        if errors:
+            for e in errors:
+                st.error(e)
+            st.stop()
+        config_dict = build_config(manual_centers)
+        try:
+            config = ScenarioConfig.model_validate(config_dict)
+        except ConfigError as exc:
+            st.error(f"Ошибка конфигурации: {exc}")
+            st.stop()
+        if not config.frames.enabled:
+            st.error("Для исследования сходимости включите кадры РСА (панель «Кадры РСА» слева).")
+            st.stop()
+        n_candidates = config.objects.count * len(config.frames.pass_azimuths_deg)
+        if conv_k > n_candidates:
+            st.info(
+                f"Кадров-кандидатов {n_candidates} меньше K = {int(conv_k)}: после исчерпания кадров "
+                "полнота перестанет расти, а итерации досчитаются константой."
+            )
+        try:
+            params = ConvergenceParams(
+                experiments=int(conv_m),
+                iterations=int(conv_k),
+                seed_start=int(conv_seed),
+                stabilization_tol=float(conv_tol),
+                stabilization_window=int(conv_window),
+                min_completeness=float(conv_min),
+                temperature=float(conv_temp),
+            )
+        except ValueError as exc:
+            st.error(f"Ошибка параметров исследования: {exc}")
+            st.stop()
+
+        progress = st.progress(0.0, text="Исследование сходимости…")
+        study = run_convergence_study(
+            config,
+            params,
+            workers=int(conv_workers),
+            progress=lambda done, total: progress.progress(done / total, text=f"Экспериментов завершено: {done}/{total}"),
+        )
+        progress.empty()
+        st.session_state["convergence"] = study
+        st.session_state["convergence_dir"] = tempfile.mkdtemp(prefix="sro_conv_")
+
+    study = st.session_state.get("convergence")
+    if study:
+        render_convergence(study, st.session_state.get("convergence_dir") or tempfile.mkdtemp(prefix="sro_conv_"))
