@@ -1,10 +1,16 @@
-"""Графический интерфейс генератора района СРО (Streamlit).
+"""Графический интерфейс SRO Generator 2.0.0 (Streamlit).
 
-Одиночный прогон: кнопка «Сгенерировать».
-Серия прогонов: задайте число прогонов и потоков — прогоны выполняются
-параллельно (seed = базовый … базовый + N − 1) и сводятся в статистику.
-Исследование сходимости: M независимых экспериментов × K итераций
-итерационного алгоритма формирования кадров на фиксированном сценарии.
+Две вкладки:
+1. «Генерация СРО» — настройка района и объектов, воспроизводимая генерация
+   (seed), визуализация района, объектов, облачности и кадров досъёмки РСА,
+   расчёт геометрической полноты покрытия (G — район, C — скрытые объекты).
+2. «Статистическое исследование» — оценивание математического ожидания и
+   дисперсии геометрической полноты покрытия района методом статистических
+   испытаний (M*(n), D̃(n), σ̃(n), ε(β,n), пять обязательных графиков).
+
+Исследовательские стенды — в benchmarks/ (convergence_analysis.py,
+monte_carlo_convergence.py, cloud_coverage_analysis.py); вычислительные
+функции сохранены в sro_generator/convergence.py и sro_generator/monte_carlo.py.
 
 Запуск: streamlit run app.py
 """
@@ -15,29 +21,24 @@ import io
 import os
 import tempfile
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
 from sro_generator.config import ConfigError, ScenarioConfig
-from sro_generator.convergence import (
-    ConvergenceParams,
-    render_convergence_charts,
-    run_convergence_study,
-    write_convergence_csv,
-    write_convergence_json,
-)
-from sro_generator.export import render_preview
 from sro_generator.generator import generate_scenario
-from sro_generator.placement import PlacementError
-from sro_generator.stats import (
-    render_analytics_charts,
-    render_report_charts,
-    run_batch,
-    write_batch_csv,
+from sro_generator.monte_carlo import (
+    classical_series,
+    k_sweep,
+    render_classical_charts,
+    required_trials,
+    run_monte_carlo_experiment,
+    MonteCarloParams,
 )
+from sro_generator.placement import PlacementError
 
-st.set_page_config(page_title="Генератор района СРО", layout="wide")
-st.title("Генератор района со случайно расположенными объектами (СРО)")
+st.set_page_config(page_title="SRO Generator 2.0", layout="wide")
+st.title("SRO Generator 2.0 — генерация СРО и статистическое исследование досъёмки РСА")
 
 with st.sidebar:
     st.header("Район")
@@ -87,11 +88,13 @@ with st.sidebar:
     cross_km = st.number_input("Размер поперёк трассы, км", value=5.0, min_value=0.1)
     azimuths = st.text_input("Азимуты пролёта, град (через запятую)", "194.0, 346.0")
 
+    st.header("Облачность и досъёмка")
+    cloud_fraction = st.slider("Доля объектов, недоступных оптике (облачность)", 0.0, 1.0, 0.4)
+
     st.header("Воспроизводимость")
     seed = st.number_input("Seed (базовый)", value=42, step=1)
 
-    st.header("Серия прогонов")
-    n_runs = st.number_input("Число прогонов", value=10, min_value=2, max_value=2000, step=10)
+    st.header("Вычисления")
     workers = st.number_input(
         "Параллельных потоков",
         value=min(4, os.cpu_count() or 1),
@@ -122,7 +125,7 @@ def parse_manual_centers(df) -> tuple[list[dict], list[str]]:
 
 
 def build_config(manual_centers: list[dict]) -> dict:
-    """Собрать конфигурацию из параметров сайдбара (та же структура, что и раньше)."""
+    """Собрать конфигурацию из параметров сайдбара."""
     return {
         "name": name,
         "seed": int(seed),
@@ -169,196 +172,80 @@ def build_config(manual_centers: list[dict]) -> dict:
     }
 
 
-def render_batch(batch: dict, out_dir: str) -> None:
-    """Показать результаты серии: метрики, графики, таблицы, выгрузки."""
-    s = batch["summary"]
-    st.success(f"Серия завершена: успешно {s['n_ok']} из {s['n_runs']} прогонов.")
-    if s["n_failed"]:
-        st.warning(f"Упавших прогонов: {s['n_failed']} (см. вкладку «Ошибки»).")
+def render_preview_cloud(scenario, hidden_flags, frames_selected, path, show_frames=True, labels=True):
+    """Район, объекты (скрытые от оптики — серым со штриховкой), кадры досъёмки."""
+    import matplotlib
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Попыток размещения (среднее)", f"{s['attempts_total']['mean']:,.0f}")
-    m2.metric("Время прогона, с (среднее)", f"{s['duration_s']['mean']:.3f}")
-    m3.metric("Fill ratio (среднее)", f"{s['fill_ratio']['mean']:.4f}")
-    m4.metric("Покрытие объектов (среднее)", f"{s['coverage_fraction']['mean']:.3f}")
-    m5.metric("Доля полных кадров", f"{s['full_coverage_share']:.1%}")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon as MplPolygon
 
-    tab_charts, tab_analytics, tab_runs, tab_files, tab_errors = st.tabs(
-        ["Графики", "Аналитика", "Прогоны", "CSV", "Ошибки"]
-    )
-
-    chart_paths = render_report_charts(batch, out_dir)
-    csv_paths = write_batch_csv(batch, out_dir)
-
-    with tab_charts:
-        for p in chart_paths.values():
-            st.image(str(p))
-
-    with tab_analytics:
-        st.caption(
-            "Статистические проверки — это проверки согласия с заявленной гипотезой, "
-            "а не доказательство равномерности: ограничения размещения систематически "
-            "меняют распределение принимаемых объектов."
-        )
-        tests = s.get("statistical_tests", {})
-        if tests:
-            st.dataframe(pd.DataFrame([
-                {
-                    "тест": name,
-                    "тип": t.get("kind"),
-                    "статистика": (round(t["statistic"], 6)
-                                   if isinstance(t.get("statistic"), float) else None),
-                    "df": t.get("df"),
-                    "p-value": (round(t["p_value"], 6)
-                                if isinstance(t.get("p_value"), float) else None),
-                    "n": t.get("n"),
-                    "применим": t.get("applicable"),
-                    "предупреждения": " | ".join(t.get("warnings", [])),
-                }
-                for name, t in tests.items()
-            ]))
-        if s.get("clark_evans_warnings"):
-            for w in s["clark_evans_warnings"]:
-                st.warning(w)
-        analytics_paths = render_analytics_charts(batch, out_dir)
-        for p in analytics_paths.values():
-            st.image(str(p))
-
-    with tab_runs:
-        st.dataframe(pd.DataFrame([
-            {
-                "seed": r["seed"],
-                "ok": r["ok"],
-                "duration_s": round(r.get("duration_s", 0.0), 4),
-                "attempts_total": r.get("attempts_total"),
-                "fill_ratio": round(r.get("fill_ratio", 0.0), 6),
-                "nnd_mean_m": round(r.get("nnd_mean_m", 0.0), 1),
-                "n_objects": len(r.get("objects", [])),
-                "frames_total": len(r.get("coverage", [])),
-                "full_coverage_frames": r.get("full_coverage_frames"),
-                "warnings": len(r.get("warnings", [])),
-            }
-            for r in batch["runs"]
-        ]))
-        st.caption(
-            "χ²/df: вершины = %.3g, категории = %.3g, ячейки района = %.3g "
-            "(значения около 1.0 — распределение близко к равномерному)"
-            % (s["vertex_chi2_df"], s["class_chi2_df"], s["quadrant_chi2_df"])
-        )
-
-    with tab_files:
-        for name_csv, p in csv_paths.items():
-            with open(p, "rb") as f:
-                st.download_button(f"Скачать {name_csv}", f.read(), file_name=name_csv, mime="text/csv")
-        st.caption(
-            "runs_summary.csv — метрики по каждому прогону; "
-            "objects_all.csv — все объекты всех прогонов (для pandas/R: сводные таблицы, критерии согласия, корреляции)."
-        )
-
-    with tab_errors:
-        if s["errors"]:
-            for e in s["errors"]:
-                st.error(f"seed={e['seed']}: {e['error']}")
+    fig, ax = plt.subplots(figsize=(10, 10))
+    dx, dy = scenario.district_local.exterior.xy
+    ax.plot(dx, dy, "k-", linewidth=1.5, label="Район")
+    colors = plt.cm.tab20.colors
+    sel_ids = set(frames_selected)
+    for i, o in enumerate(scenario.objects):
+        x, y = o.geometry.exterior.xy
+        if hidden_flags[i]:
+            patch = MplPolygon(list(zip(x, y)), closed=True, facecolor="0.75",
+                               edgecolor="0.3", hatch="///", alpha=0.85,
+                               label="объект недоступен оптике" if i == int(np.argmax(hidden_flags)) else None)
         else:
-            st.info("Ошибок нет — все прогоны завершились успешно.")
+            patch = MplPolygon(list(zip(x, y)), closed=True, facecolor=colors[i % len(colors)],
+                               edgecolor="black", linewidth=0.6, alpha=0.8,
+                               label="объект доступен оптике" if not any(hidden_flags[:i]) else None)
+        ax.add_patch(patch)
+        if labels:
+            cx, cy = o.center.x, o.center.y
+            ax.annotate(o.object_id, (cx, cy), fontsize=7, ha="center", va="center")
+    if show_frames:
+        for f in scenario.frames:
+            x, y = f.geometry.exterior.xy
+            selected = f.frame_id in sel_ids
+            ax.plot(x, y, color="#d62728" if selected else "#1f77b4",
+                    linewidth=1.8 if selected else 0.7,
+                    linestyle="-" if selected else "--",
+                    alpha=0.95 if selected else 0.35,
+                    label="кадр досъёмки (план)" if selected and f.frame_id == frames_selected[0] else
+                          ("кадр-кандидат" if f.frame_id == scenario.frames[0].frame_id else None))
+    ax.set_aspect("equal")
+    ax.autoscale_view()
+    ax.set_xlabel("x, м (локальная СК)")
+    ax.set_ylabel("y, м (локальная СК)")
+    ax.set_title(f"Район «{scenario.config.name}», seed={scenario.config.seed}")
+    ax.grid(True, alpha=0.3)
+    handles, lbls = ax.get_legend_handles_labels()
+    by_label = dict(zip(lbls, handles))
+    if by_label:
+        ax.legend(by_label.values(), by_label.keys(), fontsize=8, loc="upper right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    return path
 
 
-_VERDICT_TO_MESSAGE = {
-    "converged": st.success,
-    "stagnation": st.warning,
-    "different_local_optima": st.warning,
-    "no_convergence": st.error,
-}
+tab_gen, tab_stat = st.tabs(["Генерация СРО", "Статистическое исследование"])
 
-
-def render_convergence(study: dict, out_dir: str) -> None:
-    """Показать результаты исследования сходимости: диагноз, метрики, графики, таблицы, выгрузки."""
-    c = study["convergence"]
-    params = study["params"]
-    _VERDICT_TO_MESSAGE[c["verdict"]](c["verdict_ru"] + ".")
-    st.caption(c["detail"])
-    for w in study.get("warnings", []):
-        st.warning(w)
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Итоговая средняя полнота", f"{c['final_mean']:.4f}")
-    m2.metric("Итоговое std между экспериментами", f"{c['final_std']:.4f}")
-    m3.metric("Разброс p10–p90 (на K)", f"{c['final_band_p10_p90']:.4f}")
-    m4.metric("Стабилизировалось",
-              f"на k = {c['stabilized_at_iteration']}" if c["stabilized_at_iteration"] else "нет")
-    m5.metric("Экспериментов × итераций", f"{params['experiments']} × {params['iterations']}")
-
-    tab_summary, tab_exp, tab_files = st.tabs(["Сводка по итерациям", "Эксперименты", "CSV / JSON / PNG"])
-
-    chart_paths = render_convergence_charts(study, out_dir)
-    csv_paths = write_convergence_csv(study, out_dir)
-    json_path = write_convergence_json(study, out_dir)
-
-    with tab_summary:
-        st.dataframe(pd.DataFrame([
-            {
-                "k": s["iteration"],
-                "среднее": round(s["mean"], 6),
-                "std": round(s["std"], 6),
-                "медиана": round(s["median"], 6),
-                "p10": round(s["p10"], 6),
-                "p90": round(s["p90"], 6),
-                "ДИ95 нижн.": round(s["ci95_low"], 6),
-                "ДИ95 верхн.": round(s["ci95_high"], 6),
-                "средний прирост": round(s["mean_increment"], 6),
-            }
-            for s in study["iteration_stats"]
-        ]))
-        st.caption(
-            "Статистики по фактическим результатам M независимых экспериментов на каждой итерации; "
-            "std — ddof=1, доверительный интервал среднего — 95%-й (t-критическое). "
-            "Полнота I(k) = 0.5·(покрытие района ∪ кадров + покрытие объектов ∪ кадров), "
-            "перекрытия в объединении не считаются дважды."
-        )
-        for p in chart_paths.values():
-            st.image(str(p))
-
-    with tab_exp:
-        st.dataframe(pd.DataFrame([
-            {
-                "эксперимент": e["experiment"],
-                "seed": e["seed"],
-                "итоговая полнота": round(e["final_completeness"], 6),
-                "время, с": round(e["duration_s"], 3),
-                "выбрано кадров": sum(1 for f in e["frames_selected"] if f),
-            }
-            for e in study["experiments"]
-        ]))
-        st.caption("Полная траектория I(k) каждого эксперимента — в convergence_trajectories.csv и convergence.json.")
-
-    with tab_files:
-        for name_csv, p in csv_paths.items():
-            with open(p, "rb") as f:
-                st.download_button(f"Скачать {name_csv}", f.read(), file_name=name_csv, mime="text/csv")
-        with open(json_path, "rb") as f:
-            st.download_button("Скачать convergence.json", f.read(), file_name="convergence.json",
-                               mime="application/json")
-        for name_png, p in chart_paths.items():
-            with open(p, "rb") as f:
-                st.download_button(f"Скачать {name_png}", f.read(), file_name=name_png, mime="image/png")
-        st.caption(
-            "convergence_trajectories.csv — полная траектория I(k) каждого эксперимента; "
-            "convergence_summary.csv — статистика по номерам итераций; "
-            "convergence_experiments.csv — итоги экспериментов; "
-            "convergence.json — всё исследование (параметры, траектории, диагноз)."
-        )
-
-
-tab_gen, tab_conv = st.tabs(["Генерация и серия", "Сходимость алгоритма"])
-
+# ---------------------------------------------------------------------------
+# Вкладка 1. Генерация СРО
+# ---------------------------------------------------------------------------
 with tab_gen:
-    st.subheader("Ручные центры (пусто — полностью случайное размещение)")
+    st.subheader("Генерация района со случайными объектами (СРО)")
+    st.caption(
+        "Один прогон: детерминированная генерация из seed. Облачность — независимая "
+        "бинарная маска «объект недоступен оптике»; кадры РСА — план досъёмки "
+        "(запланированные наблюдения, не выполненные съёмки). Красным выделены "
+        "кадры плана, серым со штриховкой — объекты под облачностью."
+    )
     centers_df = st.data_editor(
         pd.DataFrame(columns=["object_id", "latitude", "longitude"]),
         num_rows="dynamic",
         key="manual_centers",
     )
-
+    gen_k = st.number_input("Итераций досъёмки K", value=30, min_value=1, max_value=500, step=5,
+                            key="gen_k")
+    gen_sel = st.selectbox("Алгоритм досъёмки", ["greedy", "softmax"], key="gen_sel")
     show_frames = st.checkbox("Показывать кадры на рисунке", value=True) if frames_enabled else False
     show_labels = st.checkbox("Подписи object_id", value=True)
 
@@ -368,7 +255,6 @@ with tab_gen:
             for e in errors:
                 st.error(e)
             st.stop()
-
         config_dict = build_config(manual_centers)
         try:
             config = ScenarioConfig.model_validate(config_dict)
@@ -376,28 +262,51 @@ with tab_gen:
             st.error(f"Ошибка конфигурации: {exc}")
             st.stop()
 
-        with st.spinner("Генерация…"):
+        with st.spinner("Генерация и расчёт полноты…"):
             try:
                 scenario = generate_scenario(config)
             except PlacementError as exc:
                 st.error(f"Ошибка размещения: {exc}")
                 st.stop()
+            if frames_enabled:
+                params = MonteCarloParams(
+                    experiments=2, iterations=int(gen_k), checkpoints=(2,),
+                    cloud_fraction=float(cloud_fraction), selection=gen_sel,
+                )
+                exp = run_monte_carlo_experiment(config, params, int(seed))
+                scenario2 = generate_scenario(
+                    ScenarioConfig.model_validate({**config_dict, "seed": exp["seed"]})
+                )
+                mask_rng = np.random.default_rng(np.random.SeedSequence([exp["seed"], 20261126]))
+                hidden = list(mask_rng.random(len(scenario2.objects)) < cloud_fraction)
+                preview = render_preview_cloud(scenario2, hidden, exp["frames_selected"],
+                                               "/tmp/sro_preview.png", show_frames, show_labels)
+                g_val, c_val = exp["final_geometric_completeness"], exp["hidden_objects_coverage"]
+                optical = exp["optical_district_coverage"]
+            else:
+                hidden = [False] * len(scenario.objects)
+                preview = render_preview_cloud(scenario, hidden, [],
+                                               "/tmp/sro_preview.png", False, show_labels)
+                g_val = c_val = optical = None
 
-        preview_path = render_preview(scenario, "/tmp/sro_preview.png", show_frames=show_frames, labels=show_labels)
         col_l, col_r = st.columns([3, 2])
         with col_l:
-            st.image(str(preview_path), caption=f"Район «{config.name}», seed={config.seed}")
-
+            st.image(str(preview), caption=f"Район «{config.name}», seed={config.seed}")
         areas = [o.area_m2 for o in scenario.objects]
-        manual_share = sum(1 for o in scenario.objects if o.coordinate_fixed) / len(scenario.objects)
         with col_r:
             st.subheader("Сводка")
             st.metric("Число объектов", len(scenario.objects))
-            st.metric("Кадров", len(scenario.frames))
+            st.metric("Кадров-кандидатов", len(scenario.frames))
             st.metric("Площадь объектов, м²", f"{min(areas):,.0f} – {max(areas):,.0f}")
-            st.metric("Вершин (мин–макс)", f"{min(o.vertex_count for o in scenario.objects)} – {max(o.vertex_count for o in scenario.objects)}")
-            st.metric("Доля ручных центров", f"{manual_share:.0%}")
-            st.metric("Попыток размещения", scenario.report.attempts_total)
+            st.metric("Вершин (мин–макс)", f"{min(o.vertex_count for o in scenario.objects)} – "
+                                            f"{max(o.vertex_count for o in scenario.objects)}")
+            st.metric("Под облачностью", f"{sum(hidden)} из {len(hidden)}")
+            if g_val is not None:
+                st.metric("Оптическое покрытие района", f"{optical:.4f}")
+                st.metric("Полнота досъёмки скрытых C", f"{c_val:.4f}")
+                st.metric("Итоговая полнота района G", f"{g_val:.4f}")
+            st.metric("Доля ручных центров",
+                      f"{sum(1 for o in scenario.objects if o.coordinate_fixed) / len(scenario.objects):.0%}")
             for w in scenario.warnings:
                 st.warning(w)
 
@@ -420,121 +329,126 @@ with tab_gen:
         ]))
 
         buf = io.BytesIO()
-        with open(preview_path, "rb") as f:
+        with open(preview, "rb") as f:
             buf.write(f.read())
-        st.download_button("Скачать preview.png", buf.getvalue(), file_name="preview.png", mime="image/png")
-        st.session_state["scenario"] = scenario
+        st.download_button("Скачать preview.png", buf.getvalue(), file_name="preview.png",
+                           mime="image/png")
 
-    st.divider()
-    st.subheader("Серия прогонов для анализа и статистики")
+# ---------------------------------------------------------------------------
+# Вкладка 2. Статистическое исследование
+# ---------------------------------------------------------------------------
+with tab_stat:
+    st.subheader("Оценивание математического ожидания и дисперсии геометрической "
+                 "полноты покрытия района при досъёмке средствами РСА ДЗЗ "
+                 "методом статистических испытаний")
     st.caption(
-        f"Каждый прогон — независимая генерация со своим seed "
-        f"({int(seed)} … {int(seed) + int(n_runs) - 1}). Прогоны идут параллельно в {int(workers)} поток(ах); "
-        "упавшие прогоны фиксируются и не прерывают серию."
+        "Каждое испытание — новая случайная конфигурация объектов СРО со своим seed; "
+        "облачность скрывает часть объектов от оптики, алгоритм досъёмки РСА строит "
+        "план из K кадров. Реализация случайной величины xᵢ — геометрическая полнота "
+        "покрытия G итогового плана. Графики 1–4 — сходимость статистических оценок "
+        "при росте объёма испытаний n (фиксированный K); график 5 — сходимость "
+        "алгоритма планирования при росте числа итераций K (фиксированный n). "
+        "K — число итераций алгоритма, не число пролётов КА."
     )
 
-    if st.button(f"Запустить серию: {int(n_runs)} прогонов", type="primary"):
-        manual_centers, errors = parse_manual_centers(centers_df)
-        if errors:
-            for e in errors:
-                st.error(e)
-            st.stop()
-        config_dict = build_config(manual_centers)
-        try:
-            ScenarioConfig.model_validate(config_dict)
-        except ConfigError as exc:
-            st.error(f"Ошибка конфигурации: {exc}")
-            st.stop()
+    sc1, sc2, sc3 = st.columns(3)
+    n_trials = sc1.number_input("Число статистических испытаний n", value=200, min_value=3,
+                                max_value=5000, step=50)
+    beta = sc2.selectbox("Надёжность β", [0.90, 0.95, 0.99], index=1)
+    epsilon0 = sc3.number_input("Заданная точность ε₀", value=0.01, min_value=0.0001,
+                                format="%.4f")
+    sc4, sc5, sc6 = st.columns(3)
+    k_fixed = sc4.number_input("Число итераций алгоритма K", value=70, min_value=1, max_value=300, step=5)
+    selection = sc5.selectbox("Алгоритм досъёмки", ["greedy", "softmax"], key="stat_sel")
+    k_grid = sc6.multiselect("Сетка K для графика 5", [5, 10, 20, 30, 50, 70],
+                             default=[5, 10, 20, 30, 50, 70])
+    if not k_grid:
+        st.error("Выберите хотя бы одно значение K для сетки.")
+        st.stop()
+    k_values = tuple(sorted({int(k) for k in k_grid} | {int(k_fixed)}))
 
-        progress = st.progress(0.0, text="Серия прогонов…")
-        batch = run_batch(
-            config_dict,
-            n_runs=int(n_runs),
-            workers=int(workers),
-            seed_start=int(seed),
-            progress=lambda done, total: progress.progress(done / total, text=f"Прогонов завершено: {done}/{total}"),
-        )
-        progress.empty()
-        st.session_state["batch"] = batch
-        st.session_state["batch_dir"] = tempfile.mkdtemp(prefix="sro_batch_")
-
-    batch = st.session_state.get("batch")
-    if batch:
-        render_batch(batch, st.session_state.get("batch_dir") or tempfile.mkdtemp(prefix="sro_batch_"))
-
-with tab_conv:
-    st.subheader("Исследование сходимости итерационного алгоритма формирования кадров РСА")
-    st.caption(
-        "Для фиксированного сценария (район, объекты и кадры-кандидаты неизменны — "
-        "случайность только в алгоритме) проводится M независимых экспериментов, "
-        "каждый содержит K последовательных итераций рандомизированного жадного отбора кадров. "
-        "После каждой итерации сохраняется полнота информации I(k) — покрытие района и объектов "
-        "объединением выбранных кадров без повторного счёта перекрытий."
-    )
-    cc1, cc2, cc3 = st.columns(3)
-    conv_m = cc1.number_input("Экспериментов M", value=20, min_value=2, max_value=500, step=5)
-    conv_k = cc2.number_input("Итераций K", value=30, min_value=1, max_value=500, step=5)
-    conv_seed = cc3.number_input("Начальный seed экспериментов", value=0, step=1)
-    cc4, cc5, cc6 = st.columns(3)
-    conv_tol = cc4.number_input("Критерий стабилизации: порог прироста", value=0.001, min_value=0.000001,
-                                format="%.6f")
-    conv_window = cc5.number_input("Критерий стабилизации: окно, итераций", value=3, min_value=1, step=1)
-    conv_min = cc6.number_input("Минимально требуемая полнота", value=0.9, min_value=0.0, max_value=1.0)
-    cc7, cc8 = st.columns(2)
-    conv_temp = cc7.number_input("Температура алгоритма", value=0.25, min_value=0.001, format="%.3f")
-    conv_workers = cc8.number_input(
-        "Параллельных потоков (исследование)",
-        value=min(4, os.cpu_count() or 1),
-        min_value=1, max_value=32, step=1,
-        key="conv_workers",
-    )
-
-    if st.button("Запустить исследование сходимости", type="primary"):
-        manual_centers, errors = parse_manual_centers(centers_df)
-        if errors:
-            for e in errors:
-                st.error(e)
-            st.stop()
-        config_dict = build_config(manual_centers)
+    if st.button("Провести статистические испытания", type="primary"):
+        config_dict = build_config([])
         try:
             config = ScenarioConfig.model_validate(config_dict)
         except ConfigError as exc:
             st.error(f"Ошибка конфигурации: {exc}")
             st.stop()
         if not config.frames.enabled:
-            st.error("Для исследования сходимости включите кадры РСА (панель «Кадры РСА» слева).")
-            st.stop()
-        n_candidates = config.objects.count * len(config.frames.pass_azimuths_deg)
-        if conv_k > n_candidates:
-            st.info(
-                f"Кадров-кандидатов {n_candidates} меньше K = {int(conv_k)}: после исчерпания кадров "
-                "полнота перестанет расти, а итерации досчитаются константой."
-            )
-        try:
-            params = ConvergenceParams(
-                experiments=int(conv_m),
-                iterations=int(conv_k),
-                seed_start=int(conv_seed),
-                stabilization_tol=float(conv_tol),
-                stabilization_window=int(conv_window),
-                min_completeness=float(conv_min),
-                temperature=float(conv_temp),
-            )
-        except ValueError as exc:
-            st.error(f"Ошибка параметров исследования: {exc}")
+            st.error("Включите кадры РСА (панель «Кадры РСА» слева).")
             st.stop()
 
-        progress = st.progress(0.0, text="Исследование сходимости…")
-        study = run_convergence_study(
+        progress = st.progress(0.0, text="Статистические испытания…")
+        sweep = k_sweep(
             config,
-            params,
-            workers=int(conv_workers),
-            progress=lambda done, total: progress.progress(done / total, text=f"Экспериментов завершено: {done}/{total}"),
+            cloud_fraction=float(cloud_fraction),
+            k_values=k_values,
+            selection=selection,
+            experiments=int(n_trials),
+            seed_start=0,
+            beta=float(beta),
+            workers=int(workers),
+            keep_runs=True,
+            progress=lambda done, total: progress.progress(
+                done / total, text=f"Испытаний завершено: {done}/{total}"),
         )
         progress.empty()
-        st.session_state["convergence"] = study
-        st.session_state["convergence_dir"] = tempfile.mkdtemp(prefix="sro_conv_")
+        st.session_state["stat_sweep"] = sweep
+        st.session_state["stat_k_fixed"] = int(k_fixed)
+        st.session_state["stat_beta"] = float(beta)
+        st.session_state["stat_eps0"] = float(epsilon0)
 
-    study = st.session_state.get("convergence")
-    if study:
-        render_convergence(study, st.session_state.get("convergence_dir") or tempfile.mkdtemp(prefix="sro_conv_"))
+    sweep = st.session_state.get("stat_sweep")
+    if sweep:
+        k_fixed = st.session_state["stat_k_fixed"]
+        beta = st.session_state["stat_beta"]
+        epsilon0 = st.session_state["stat_eps0"]
+        if k_fixed not in sweep:
+            st.error(f"K = {k_fixed} отсутствует в сетке исследования.")
+            st.stop()
+        g_values = [r["final_geometric_completeness"] for r in sweep[k_fixed]["runs"]]
+        series = classical_series(g_values, beta=beta)
+        n_req = required_trials(series[-1]["sigma_tilde"], epsilon0, beta)
+
+        out_dir = tempfile.mkdtemp(prefix="sro_stat_")
+        chart_paths = render_classical_charts(series, sweep, beta, epsilon0, out_dir)
+
+        st.markdown("**Итоговые оценки** "
+                    f"(n = {series[-1]['n']}, β = {beta:.2f}, K = {k_fixed}, "
+                    f"облачность {cloud_fraction:.0%}, алгоритм {selection})")
+        final = series[-1]
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("M*(n)", f"{final['m_star']:.4f}")
+        m2.metric("D̃(n)", f"{final['d_tilde']:.3g}")
+        m3.metric("σ̃(n)", f"{final['sigma_tilde']:.4f}")
+        m4.metric("ε(β,n)", f"{final['epsilon']:.4f}")
+        m5.metric("n для ε₀", f"≥ {n_req['n_required']}")
+        st.caption(
+            f"Доверительный интервал математического ожидания: "
+            f"I(β={beta:.2f}, n) = [{final['ci_low']:.4f}; {final['ci_high']:.4f}]. "
+            f"Потребный объём испытаний (пилотная нормальная оценка): "
+            f"n ≥ (z·σ̃/ε₀)² = {n_req['n_required']}. {n_req['note']}"
+        )
+
+        for p in chart_paths.values():
+            st.image(str(p))
+
+        st.subheader("Таблица оценок")
+        step = max(1, len(series) // 20)
+        st.dataframe(pd.DataFrame([
+            {
+                "n": r["n"],
+                "M*(n)": round(r["m_star"], 6),
+                "D̃(n)": round(r["d_tilde"], 8),
+                "σ̃(n)": round(r["sigma_tilde"], 6),
+                "ε(β,n)": round(r["epsilon"], 6),
+                "I нижн.": round(r["ci_low"], 6),
+                "I верхн.": round(r["ci_high"], 6),
+            }
+            for r in series[::step] + [series[-1]]
+        ]))
+        st.caption(
+            "M*(n) — статистическое математическое ожидание; D̃(n) — исправленная "
+            "выборочная дисперсия (деление на n−1); σ̃(n) = √D̃; "
+            "ε(β,n) = t(β,n−1)·σ̃(n)/√n; I = [M*−ε; M*+ε]. Данные не сглаживаются."
+        )

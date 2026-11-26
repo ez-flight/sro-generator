@@ -31,8 +31,8 @@ def make_config(**overrides) -> ScenarioConfig:
 
 
 class TestVersion:
-    def test_version_is_1_2_0(self):
-        assert sro_generator.__version__ == "1.2.0"
+    def test_version_is_2_0_0(self):
+        assert sro_generator.__version__ == "2.0.0"
 
 
 class TestLegacyConfig:
@@ -73,7 +73,7 @@ class TestCli:
         out_dir = tmp_path / "out"
         cli_main(["generate", "--config", str(cfg_path), "--output", str(out_dir)])
         report = json.loads((out_dir / "generation_report.json").read_text(encoding="utf-8"))
-        assert report["version"] == "1.2.0"
+        assert report["version"] == "2.0.0"
         assert report["placement_exact_checks_total"] > 0
         assert report["placement_tree_queries"] > 0
         assert report["checks"]["count_matches_config"]
