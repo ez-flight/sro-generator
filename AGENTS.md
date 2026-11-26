@@ -160,3 +160,19 @@
   облачности; 99 % недостижим (потолок 0.985); greedy > softmax на малом K.
   Отчёт CLOUD-COVERAGE-ANALYSIS.md.
 - Версия 2.0.0, +6 тестов (всего 233, все зелёные).
+
+### 2026-11-26 — Контрольная точка перед перезагрузкой (агент Kimi Code)
+
+- Состояние полностью зафиксировано: ветка `main` = origin/main = тег
+  `v2.0.0` = коммит `a8a6952` (SRO Generator 2.0.0). Рабочее дерево чистое.
+- Тесты после перезагрузки: `.venv/bin/python -m pytest tests -q` — 233 зелёные.
+- Запуск UI: `streamlit run app.py` (при отказе в правах —
+  `chmod +x .venv/bin/streamlit` или `python -m streamlit run app.py`).
+- Исследовательские данные на диске (не в git, каталог `output/` в .gitignore):
+  `output/convergence/` (1.2.0), `output/monte_carlo/` (1.3.0, M=1000 × K=70),
+  `output/monte_carlo_m1000_k70_backup/` (резервная копия того же исследования),
+  `output/cloud_coverage/` (сетка 12 000 запусков, отчёт
+  CLOUD-COVERAGE-ANALYSIS.md опирается на эти файлы).
+- Для быстрого старта новому агенту: отчёты MONTE-CARLO-CONVERGENCE.md и
+  CLOUD-COVERAGE-ANALYSIS.md в корне — последние численные результаты;
+  повторные длительные прогоны не нужны.
