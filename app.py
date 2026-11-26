@@ -1,6 +1,6 @@
 """Графический интерфейс SRO Generator 2.1.0 (Streamlit).
 
-Три вкладки:
+Три вкладки + вкладка статистического исследования объектов съёмки:
 1. «Генерация СРО» — настройка района и объектов, воспроизводимая генерация
    (seed), визуализация района, объектов, облачности и кадров досъёмки РСА,
    расчёт геометрической полноты покрытия (G — район, C — скрытые объекты).
@@ -11,6 +11,10 @@
    целевых объектов (равномерно-случайное, групповое, регулярное, линейное),
    визуализация, геометрические характеристики, экспорт GeoJSON/JSON
    (sro_generator/target_model.py).
+4. «Статистическое исследование объектов съёмки» — проверка законов
+   размещения: n независимых реализаций каждого закона, F*(r) с имитационным
+   эталоном и кривой Рэлея, сравнение по R/I/R_b, сходимость M*(n), D̃(n),
+   ε(β,n), две таблицы, шесть обязательных графиков (PNG/SVG).
 
 Исследовательские стенды — в benchmarks/ (convergence_analysis.py,
 monte_carlo_convergence.py, cloud_coverage_analysis.py); вычислительные
@@ -45,9 +49,13 @@ from sro_generator.target_model import (
     MODEL_TITLES_RU,
     MODELS,
     SpatialModelParams,
+    collect_nn_samples,
     export_target_geojson,
     generate_target_objects,
     realization_metrics,
+    render_statistics_charts,
+    run_target_model_study,
+    sample_skewness,
 )
 
 st.set_page_config(page_title="SRO Generator 2.0", layout="wide")
@@ -238,7 +246,9 @@ def render_preview_cloud(scenario, hidden_flags, frames_selected, path, show_fra
     return path
 
 
-tab_gen, tab_stat, tab_model = st.tabs(["Генерация СРО", "Статистическое исследование", "Модель объектов съёмки"])
+tab_gen, tab_stat, tab_model, tab_model_stat = st.tabs(
+    ["Генерация СРО", "Статистическое исследование", "Модель объектов съёмки",
+     "Статистическое исследование объектов съёмки"])
 
 # ---------------------------------------------------------------------------
 # Вкладка 1. Генерация СРО
@@ -647,3 +657,178 @@ with tab_model:
             file_name="target_model_params.json",
             mime="application/json",
         )
+
+# ---------------------------------------------------------------------------
+# Вкладка 4. Статистическое исследование объектов съёмки
+# ---------------------------------------------------------------------------
+with tab_model_stat:
+    st.subheader("Статистическое исследование объектов съёмки: проверка законов "
+                 "пространственного распределения и сходимость оценок")
+    st.caption(
+        "Одно статистическое испытание — одна независимая реализация пространственного "
+        "распределения объектов (модель — вкладка «Модель объектов съёмки», район и объекты — "
+        "панель слева). Исследование: n независимых реализаций каждого из четырёх законов; "
+        "классические оценки M*(n), D̃(n), σ̃(n), ε(β,n) и доверительные интервалы. "
+        "График 2 сопоставляет эмпирическую F*(r) расстояний до ближайшего соседа с "
+        "независимым имитационным эталоном (другие seed) и аналитической кривой Рэлея для "
+        "случайного размещения (CSR). Расстояния — характеристики отдельных объектов внутри "
+        "реализации (зависимые): используются для формы распределения, а не для ДИ среднего."
+    )
+
+    ts1, ts2, ts3, ts4 = st.columns(4)
+    ts_n = ts1.number_input("Число испытаний n (реализаций на закон)", value=200, min_value=20,
+                            max_value=1000, step=20, key="ts_n")
+    ts_beta = ts2.selectbox("Надёжность β", [0.90, 0.95, 0.99], index=1, key="ts_beta")
+    ts_eps0 = ts3.number_input("Заданная точность ε₀, м", value=5.0, min_value=0.01,
+                               format="%.2f", key="ts_eps0")
+    ts_seed = ts4.number_input("Начальный seed испытаний", value=0, step=1, key="ts_seed")
+
+    ts5, ts6, ts7, ts8 = st.columns(4)
+    ts_model = ts5.selectbox("Закон для графиков 4–6", list(MODELS),
+                             format_func=lambda m: MODEL_TITLES_RU[m], key="ts_model")
+    ts_metric = ts6.selectbox(
+        "Пространственная характеристика",
+        ["nn_mean_m", "ce_r", "dispersion_index", "nn_bearing_r", "objects_area_fraction"],
+        format_func=lambda k: {
+            "nn_mean_m": "Среднее расстояние до ближайшего соседа, м",
+            "ce_r": "Индекс Кларка–Эванса R",
+            "dispersion_index": "Индекс квадрантной дисперсии I",
+            "nn_bearing_r": "Направленность R_b",
+            "objects_area_fraction": "Доля площади района",
+        }[k], key="ts_metric")
+    ts_clusters = ts7.number_input("Групп (кластерный закон)", value=5, min_value=1, step=1,
+                                   key="ts_clusters")
+    ts_sigma = ts8.number_input("СКО группы, м", value=1500.0, min_value=1.0, key="ts_sigma")
+    ts9, ts10, _, _ = st.columns(4)
+    ts_jitter = ts9.slider("Дрожание решётки (регулярный)", 0.0, 1.0, 0.6, key="ts_jitter")
+    ts_lines = ts10.number_input("Линейных структур", value=4, min_value=1, step=1, key="ts_lines")
+
+    if st.button("Провести исследование", type="primary", key="ts_run"):
+        local = LocalCRS(center_lat, center_lon)
+        district = build_district_polygon(local, width * 1000.0, height * 1000.0, rotation)
+        try:
+            ts_params = SpatialModelParams(
+                model=ts_model, count=int(count),
+                vertices_min=int(vertices_min), vertices_max=int(vertices_max),
+                area_min_m2=float(area_min), area_max_m2=float(area_max),
+                irregularity=float(irregularity), max_aspect_ratio=float(max_aspect),
+                rotation_min_deg=float(rot_min), rotation_max_deg=float(rot_max),
+                boundary_margin_m=float(boundary_margin), min_distance_m=float(min_distance),
+                n_clusters=int(ts_clusters), cluster_sigma_m=float(ts_sigma),
+                jitter_fraction=float(ts_jitter), n_lines=int(ts_lines),
+                line_sigma_m=400.0,
+            )
+        except ValueError as exc:
+            st.error(f"Ошибка параметров: {exc}")
+            st.stop()
+
+        progress = st.progress(0.0, text="Статистические испытания…")
+        study = run_target_model_study(
+            ts_params, district, realizations=int(ts_n), seed_start=int(ts_seed),
+            beta=float(ts_beta), grid=5, models=MODELS,
+            progress=lambda d, t: progress.progress(d / (3 * t),
+                                                    text=f"Испытания: {d}/{t}"),
+        )
+        nn_emp = collect_nn_samples(
+            ts_params, district, models=MODELS, realizations=int(ts_n),
+            seed_start=int(ts_seed),
+            progress=lambda d, t: progress.progress(1 / 3 + d / (3 * t),
+                                                    text=f"Выборки F*(r): {d}/{t}"),
+        )
+        nn_ref = collect_nn_samples(
+            ts_params, district, models=MODELS, realizations=int(ts_n),
+            seed_start=int(ts_seed) + 100_000,
+            progress=lambda d, t: progress.progress(2 / 3 + d / (3 * t),
+                                                    text=f"Имитационный эталон: {d}/{t}"),
+        )
+        progress.empty()
+
+        examples = {}
+        for m in MODELS:
+            p = SpatialModelParams(**study["per_model"][m]["params"])
+            examples[m] = generate_target_objects(
+                p, district, np.random.default_rng(np.random.SeedSequence([int(ts_seed), 20261126, len(m)])))
+
+        out_dir = tempfile.mkdtemp(prefix="sro_target_stat_")
+        charts = render_statistics_charts(
+            study, examples, nn_emp, nn_ref,
+            selected_model=ts_model, metric=ts_metric,
+            beta=float(ts_beta), epsilon0=float(ts_eps0),
+            out_dir=out_dir, formats=("png", "svg"),
+        )
+        st.session_state["ts_study"] = study
+        st.session_state["ts_charts"] = charts
+        st.session_state["ts_settings"] = {
+            "n": int(ts_n), "beta": float(ts_beta), "eps0": float(ts_eps0),
+            "seed": int(ts_seed), "model": ts_model, "metric": ts_metric,
+            "params": ts_params,
+        }
+
+    ts_study = st.session_state.get("ts_study")
+    if ts_study is not None:
+        ts_settings = st.session_state["ts_settings"]
+        ts_charts = st.session_state["ts_charts"]
+        p_used: SpatialModelParams = ts_settings["params"]
+
+        st.markdown("**Таблица 1. Исходные параметры математического моделирования**")
+        st.dataframe(pd.DataFrame([
+            {"Параметр": "Размер района, км", "Значение": f"{width:.1f} × {height:.1f}"},
+            {"Параметр": "Количество объектов", "Значение": p_used.count},
+            {"Параметр": "Площади объектов, м²", "Значение": f"{p_used.area_min_m2:,.0f} – {p_used.area_max_m2:,.0f}"},
+            {"Параметр": "Вершин контура", "Значение": f"{p_used.vertices_min} – {p_used.vertices_max}"},
+            {"Параметр": "Законы распределения", "Значение": "равномерно-случайный, кластерный, регулярный, линейный"},
+            {"Параметр": "Параметры кластерного закона", "Значение": f"K = {p_used.n_clusters}, σ = {p_used.cluster_sigma_m:,.0f} м"},
+            {"Параметр": "Параметр регулярного закона", "Значение": f"дрожание j = {p_used.jitter_fraction:.2f}"},
+            {"Параметр": "Параметры линейного закона", "Значение": f"L = {p_used.n_lines}, σ_l = {p_used.line_sigma_m:,.0f} м"},
+            {"Параметр": "Ограничения размещения", "Значение": f"отступ {p_used.boundary_margin_m:,.0f} м; мин. расстояние {p_used.min_distance_m:,.0f} м; пересечения запрещены"},
+            {"Параметр": "Объём испытаний n", "Значение": ts_settings["n"]},
+            {"Параметр": "Доверительная вероятность β", "Значение": ts_settings["beta"]},
+            {"Параметр": "Заданная точность ε₀, м", "Значение": ts_settings["eps0"]},
+            {"Параметр": "Начальный seed", "Значение": ts_settings["seed"]},
+        ]))
+
+        metric_t = ts_settings["metric"]
+        st.markdown(f"**Таблица 2. Результаты статистического оценивания** "
+                    f"(характеристика: {ts_study['metric_titles_ru'][metric_t]}, "
+                    f"n = {ts_settings['n']}, β = {ts_settings['beta']:.2f})")
+        rows = []
+        for m in MODELS:
+            pm = ts_study["per_model"][m]
+            last = pm["classical"][metric_t][-1]
+            skew = sample_skewness([r[metric_t] for r in pm["runs"]])
+            rows.append({
+                "Закон": MODEL_TITLES_RU[m],
+                "M*(n)": round(last["m_star"], 4),
+                "D̃(n)": round(last["d_tilde"], 6),
+                "σ̃(n)": round(last["sigma_tilde"], 4),
+                "ε(β,n)": round(last["epsilon"], 4),
+                "I нижн.": round(last["ci_low"], 4),
+                "I верхн.": round(last["ci_high"], 4),
+                "Асимметрия g₁": round(skew, 3),
+                "Отклон. CSR (z)": pm["ce_z_reject_share"],
+                "Отклон. CSR (χ²)": pm["csr_chi2_reject_share"],
+            })
+        st.dataframe(pd.DataFrame(rows))
+        st.caption(
+            "M*(n) = Σxᵢ/n; D̃(n) = Σ(xᵢ−M*)²/(n−1); σ̃ = √D̃; ε = t[(1+β)/2; n−1]·σ̃/√n; "
+            "I = [M*−ε; M*+ε]. xᵢ — пространственная характеристика независимой реализации. "
+            "Асимметрия g₁ — индикатор применимости t-интервалов: при |g₁| ≲ 0,5 и n ≥ 30 "
+            "интервалы устойчивы; точные χ²-интервалы дисперсии без обоснования нормальности "
+            "не применяются."
+        )
+
+        st.markdown("**Шесть обязательных научных графиков**")
+        for name in sorted(ts_charts):
+            png = next(p for p in ts_charts[name] if p.suffix == ".png")
+            st.image(str(png))
+
+        st.subheader("Экспорт графиков")
+        import zipfile
+
+        buf_png = io.BytesIO()
+        with zipfile.ZipFile(buf_png, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, ps in ts_charts.items():
+                for p in ps:
+                    zf.write(p, arcname=p.name)
+        st.download_button("Скачать все графики (PNG + SVG, zip)", buf_png.getvalue(),
+                           file_name="target_statistics_charts.zip", mime="application/zip")

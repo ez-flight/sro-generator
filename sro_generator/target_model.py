@@ -68,6 +68,11 @@ __all__ = [
     "write_target_json",
     "render_target_charts",
     "export_target_geojson",
+    "nn_distance_sample",
+    "collect_nn_samples",
+    "sample_skewness",
+    "rayleigh_cdf",
+    "render_statistics_charts",
 ]
 
 MODELS = ("uniform", "cluster", "regular", "linear")
@@ -861,5 +866,312 @@ def render_target_charts(study: dict, examples: dict, out_dir: str | Path) -> di
     fig.savefig(p, dpi=150)
     plt.close(fig)
     paths[p.name] = p
+
+    return paths
+
+
+# ---------------------------------------------------------------------------
+# Статистическое исследование законов: выборки расстояний до ближайшего
+# соседа, имитационный эталон, шесть обязательных графиков (вкладка 4)
+# ---------------------------------------------------------------------------
+
+def nn_distance_sample(result: TargetModelResult) -> np.ndarray:
+    """Выборка расстояний до ближайшего соседа одной реализации с поправкой
+    на краевые эффекты (метод граничной полосы, как в nearest_neighbor_stats):
+    включаются только объекты, чей центр удалён от границы района не меньше
+    чем на среднее расстояние d̄ реализации. Это характеристики отдельных
+    объектов внутри реализации (зависимые), а не независимые испытания —
+    использовать для формы распределения F*(r), не для ДИ среднего."""
+    objs = result.objects
+    if len(objs) < 2:
+        return np.empty(0, dtype=float)
+    pts = np.array([[o.center.x, o.center.y] for o in objs], dtype=float)
+    diff = pts[:, None, :] - pts[None, :, :]
+    dist = np.hypot(diff[..., 0], diff[..., 1])
+    np.fill_diagonal(dist, np.inf)
+    d = dist.min(axis=1)
+    edge = np.array(
+        [result.district.exterior.distance(Point(x, y)) for x, y in pts], dtype=float)
+    keep = edge >= float(d.mean())
+    if int(keep.sum()) < 2:
+        return d
+    return d[keep]
+
+
+def collect_nn_samples(
+    params: SpatialModelParams,
+    district: Polygon,
+    models: tuple[str, ...] = MODELS,
+    realizations: int = 100,
+    seed_start: int = 0,
+    progress=None,
+) -> dict[str, np.ndarray]:
+    """Пул расстояний до ближайшего соседа по независимым реализациям каждого
+    закона (для эмпирической функции распределения F*(r)).
+
+    Та же детерминированная схема seed, что в run_target_model_study
+    (seed_start + i, детерминированная перегенерация нереализуемых конфигураций),
+    поэтому при совпадающих параметрах выборки соответствуют сохранённым
+    реализациям исследования. Независимый имитационный эталон — тот же вызов
+    с другим диапазоном seed (например, seed_start = 100 000).
+    """
+    if realizations < 1:
+        raise ValueError("collect_nn_samples: число реализаций должно быть не меньше 1.")
+    out: dict[str, np.ndarray] = {}
+    done = 0
+    total = realizations * len(models)
+    for model in models:
+        p = SpatialModelParams(**{**asdict(params), "model": model})
+        pooled: list[np.ndarray] = []
+        for i in range(realizations):
+            seed_used = seed_start + i
+            for _ in range(100):
+                rng = np.random.default_rng(np.random.SeedSequence([seed_used, 20261126, len(model)]))
+                try:
+                    result = generate_target_objects(p, district, rng)
+                    break
+                except PlacementError:
+                    seed_used += 1
+            else:
+                raise PlacementError(
+                    f"collect_nn_samples: закон «{model}», реализация {i}: "
+                    "не удалось получить реализуемую конфигурацию за 100 попыток."
+                )
+            pooled.append(nn_distance_sample(result))
+            done += 1
+            if progress:
+                progress(done, total)
+        out[model] = np.concatenate(pooled) if pooled else np.empty(0, dtype=float)
+    return out
+
+
+def sample_skewness(values) -> float:
+    """Выборочный коэффициент асимметрии (Фишер–Пирсон, g1) — индикатор
+    отклонения распределения реализаций от нормального при оценке
+    применимости t-интервалов для малых выборок."""
+    arr = np.asarray(values, dtype=float)
+    arr = arr[~np.isnan(arr)]
+    n = int(arr.size)
+    if n < 3:
+        return math.nan
+    m = float(arr.mean())
+    s = float(arr.std(ddof=1))
+    if s <= 0.0:
+        return 0.0
+    return float(((arr - m) ** 3).mean() / s ** 3 * n ** 2 / ((n - 1) * (n - 2)))
+
+
+def rayleigh_cdf(r: np.ndarray, lam: float) -> np.ndarray:
+    """Теоретическая функция распределения расстояния до ближайшего соседа
+    для однородного пуассоновского процесса (CSR): F(r) = 1 − exp(−πλr²).
+
+    Аналитический эталон не учитывает запрет пересечений полигонов и краевые
+    эффекты; для законов с такими ограничениями эталоном служит независимая
+    имитационная выборка (collect_nn_samples с другим диапазоном seed).
+    """
+    r = np.asarray(r, dtype=float)
+    return 1.0 - np.exp(-math.pi * lam * r * r)
+
+
+def _empirical_cdf(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    v = np.sort(np.asarray(values, dtype=float))
+    return v, np.arange(1, v.size + 1, dtype=float) / v.size
+
+
+def render_statistics_charts(
+    study: dict,
+    examples: dict,
+    nn_empirical: dict[str, np.ndarray],
+    nn_reference: dict[str, np.ndarray] | None,
+    selected_model: str,
+    metric: str,
+    beta: float,
+    epsilon0: float,
+    out_dir: str | Path,
+    formats: tuple[str, ...] = ("png",),
+) -> dict[str, list[Path]]:
+    """Шесть обязательных научных графиков исследования законов размещения.
+
+    1 — реализации четырёх законов (единый масштаб, район и число объектов);
+    2 — эмпирические F*(r) расстояний до ближайшего соседа: по каждому закону
+        эмпирика (испытания), независимый имитационный эталон и аналитическая
+        кривая Рэлея для CSR;
+    3 — сравнение законов по R, I и R_b с доверительными границами (M* ± ε);
+    4 — сходимость статистического математического ожидания M*(n) выбранной
+        характеристики выбранного закона (ДИ при заданной β);
+    5 — сходимость исправленной выборочной дисперсии D̃(n);
+    6 — точность оценивания ε(β,n) с линией заданной точности ε₀ и оценкой
+        потребного объёма испытаний.
+
+    Возвращает имя графика → список путей (по одному на формат).
+    """
+    import matplotlib
+    from pathlib import Path
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon as MplPolygon
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, list[Path]] = {}
+    models = study["models"]
+    colors = plt.cm.tab10.colors
+    model_colors = {m: colors[i % len(colors)] for i, m in enumerate(models)}
+
+    def save(fig, name: str) -> None:
+        fig.tight_layout()
+        paths[name] = []
+        for fmt in formats:
+            p = out / f"{name}.{fmt}"
+            fig.savefig(p, dpi=150)
+            paths[name].append(p)
+        plt.close(fig)
+
+    # --- График 1: реализации четырёх законов ---------------------------------
+    fig, axes = plt.subplots(1, len(models), figsize=(5.2 * len(models), 5.6))
+    if len(models) == 1:
+        axes = [axes]
+    for ax, model in zip(axes, models):
+        res = examples[model]
+        dx, dy = res.district.exterior.xy
+        ax.plot(dx, dy, "k-", linewidth=1.2)
+        for chord in res.line_chords:
+            cx, cy = chord.xy
+            ax.plot(cx, cy, color="0.5", linestyle="--", linewidth=1.0)
+        for c in res.cluster_centers:
+            ax.plot(c.x, c.y, marker="x", color="red", markersize=9, markeredgewidth=2.0)
+        for o in res.objects:
+            x, y = o.geometry.exterior.xy
+            ax.add_patch(MplPolygon(list(zip(x, y)), closed=True,
+                                    facecolor=model_colors[model], edgecolor="black",
+                                    linewidth=0.5, alpha=0.75))
+        ax.set_aspect("equal")
+        ax.set_title(MODEL_TITLES_RU[model], fontsize=11)
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.suptitle("График 1. Реализации случайного пространственного распределения "
+                 "объектов наблюдения", fontsize=12)
+    save(fig, "stat_chart1_realizations")
+
+    # --- График 2: эмпирические и эталонные F(r) ------------------------------
+    lam = None
+    fig, axes = plt.subplots(1, len(models), figsize=(5.4 * len(models), 5.2))
+    if len(models) == 1:
+        axes = [axes]
+    for ax, model in zip(axes, models):
+        emp = nn_empirical.get(model)
+        if emp is None or emp.size == 0:
+            continue
+        r_max = float(np.percentile(emp, 99.5))
+        xs, ys = _empirical_cdf(emp)
+        ax.step(xs, ys, where="post", color=model_colors[model], linewidth=1.6,
+                label=f"эмпирическая F*(r), {study['realizations']} реализаций")
+        if nn_reference is not None and model in nn_reference and nn_reference[model].size:
+            xr, yr = _empirical_cdf(nn_reference[model])
+            ax.step(xr, yr, where="post", color="black", linewidth=1.1, alpha=0.8,
+                    linestyle="--", label="имитационный эталон (независимые seed)")
+        if lam is None:
+            lam = study["per_model"][model]["runs"][0]["n_objects"] / study["district_area_m2"]
+        rgrid = np.linspace(0.0, r_max, 400)
+        ax.plot(rgrid, rayleigh_cdf(rgrid, lam), color="red", linewidth=1.3,
+                linestyle=":", label="теоретическая F(r) для CSR (Рэлей)")
+        ax.set_xlim(0.0, r_max)
+        ax.set_ylim(0.0, 1.02)
+        ax.set_title(MODEL_TITLES_RU[model], fontsize=11)
+        ax.set_xlabel("r, м")
+        ax.set_ylabel("F(r)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=7.5, loc="lower right")
+    fig.suptitle("График 2. Эмпирические и эталонные функции распределения расстояний "
+                 "до ближайшего соседа\n(краевая поправка граничной полосы; запрет "
+                 "пересечений учитывается имитационным эталоном)", fontsize=12)
+    save(fig, "stat_chart2_nn_cdf")
+
+    # --- График 3: сравнение законов по индексам ------------------------------
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8))
+    for ax, metr, title in (
+        (axes[0], "ce_r", "Индекс Кларка–Эванса R"),
+        (axes[1], "dispersion_index", "Индекс квадрантной дисперсии I"),
+        (axes[2], "nn_bearing_r", "Характеристика направленности R_b"),
+    ):
+        means, halves, labels, cols = [], [], [], []
+        for model in models:
+            last = study["per_model"][model]["classical"][metr][-1]
+            means.append(last["m_star"])
+            halves.append(last["epsilon"])
+            labels.append(MODEL_TITLES_RU[model])
+            cols.append(model_colors[model])
+        x = np.arange(len(models))
+        ax.bar(x, means, yerr=halves, capsize=5, color=cols, alpha=0.8,
+               edgecolor="black", linewidth=0.5)
+        ax.axhline(1.0 if metr != "nn_bearing_r" else 0.0,
+                   color="black", linestyle="--", linewidth=1.0, alpha=0.7)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=8, rotation=12)
+        ax.set_title(f"{title}\n(M* ± ε, β = {beta:.2f}, n = {study['realizations']})", fontsize=10)
+        ax.grid(True, axis="y", alpha=0.3)
+    fig.suptitle("График 3. Статистические характеристики пространственного распределения",
+                 fontsize=12)
+    save(fig, "stat_chart3_indices")
+
+    # --- Графики 4–6: сходимость оценок выбранной характеристики --------------
+    if selected_model not in study["per_model"]:
+        raise ValueError(f"render_statistics_charts: закон «{selected_model}» отсутствует в исследовании.")
+    if metric not in study["per_model"][selected_model]["classical"]:
+        raise ValueError(f"render_statistics_charts: неизвестная характеристика «{metric}».")
+    series = study["per_model"][selected_model]["classical"][metric]
+    ns = np.array([r["n"] for r in series], dtype=float)
+    m_star = np.array([r["m_star"] for r in series], dtype=float)
+    d_tilde = np.array([r["d_tilde"] for r in series], dtype=float)
+    eps = np.array([r["epsilon"] for r in series], dtype=float)
+    lo = np.array([r["ci_low"] for r in series], dtype=float)
+    hi = np.array([r["ci_high"] for r in series], dtype=float)
+    title_ru = study["metric_titles_ru"].get(metric, metric)
+    law_ru = MODEL_TITLES_RU[selected_model]
+    color = model_colors[selected_model]
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.fill_between(ns, lo, hi, color=color, alpha=0.25, label=f"ДИ I(β,n), β = {beta:.2f}")
+    ax.plot(ns, m_star, color=color, linewidth=1.8, label="M*(n)")
+    ax.axhline(m_star[-1], color="gray", linestyle=":", linewidth=1.0,
+               label=f"M*({int(ns[-1])}) = {m_star[-1]:.4f}")
+    ax.set_title(f"График 4. Статистическое математическое ожидание M*(n)\n"
+                 f"{title_ru} — {law_ru}", fontsize=11)
+    ax.set_xlabel("объём испытаний n (независимых реализаций)")
+    ax.set_ylabel("M*(n)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+    save(fig, "stat_chart4_mean")
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.plot(ns, d_tilde, color=color, linewidth=1.8, label="D̃(n) (деление на n−1)")
+    ax.axhline(d_tilde[-1], color="gray", linestyle=":", linewidth=1.0,
+               label=f"D̃({int(ns[-1])}) = {d_tilde[-1]:.5g}")
+    ax.set_title(f"График 5. Исправленная выборочная дисперсия D̃(n)\n"
+                 f"{title_ru} — {law_ru}", fontsize=11)
+    ax.set_xlabel("объём испытаний n (независимых реализаций)")
+    ax.set_ylabel("D̃(n)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+    save(fig, "stat_chart5_variance")
+
+    n_req = required_trials(float(series[-1]["sigma_tilde"]), epsilon0, beta=beta)
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    ax.plot(ns, eps, color=color, linewidth=1.8, label="ε(β,n) = t·σ̃/√n")
+    ax.axhline(epsilon0, color="green", linestyle="--", linewidth=1.3,
+               label=f"заданная точность ε₀ = {epsilon0:.4g}")
+    if n_req["n_required"] <= ns[-1]:
+        ax.axvline(n_req["n_required"], color="red", linestyle=":", linewidth=1.2,
+                   label=f"потребный объём n ≥ {n_req['n_required']}")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_title(f"График 6. Точность оценивания ε(β,n), β = {beta:.2f}\n"
+                 f"{title_ru} — {law_ru}", fontsize=11)
+    ax.set_xlabel("объём испытаний n (лог. шкала); потребный объём — пилотная оценка n ≥ (z·σ̃/ε₀)²")
+    ax.set_ylabel("ε(β,n) (лог. шкала)")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(fontsize=9)
+    save(fig, "stat_chart6_precision")
 
     return paths
