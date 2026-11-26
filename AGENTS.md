@@ -237,3 +237,9 @@
   (2 CSV, 2 JSON, 6 графиков PNG+SVG). Отчёт TARGET-OBJECT-STATISTICS.md.
 - Версия 2.2.0; +18 тестов (`tests/test_target_statistics.py`), всего 295.
 - Коммит локальный; push только с разрешения пользователя.
+
+### 2026-11-26 — Публикация 2.1.0 и 2.2.0 (агент Kimi Code)
+
+- По разрешению пользователя выполнен push: `main` = `30ae644`
+  (origin/main), теги `v2.1.0` (`0ac0629`) и `v2.2.0` (`30ae644`) созданы
+  и отправлены на github.com/ez-flight/sro-generator.
