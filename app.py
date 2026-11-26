@@ -1,12 +1,16 @@
-"""Графический интерфейс SRO Generator 2.0.0 (Streamlit).
+"""Графический интерфейс SRO Generator 2.1.0 (Streamlit).
 
-Две вкладки:
+Три вкладки:
 1. «Генерация СРО» — настройка района и объектов, воспроизводимая генерация
    (seed), визуализация района, объектов, облачности и кадров досъёмки РСА,
    расчёт геометрической полноты покрытия (G — район, C — скрытые объекты).
 2. «Статистическое исследование» — оценивание математического ожидания и
    дисперсии геометрической полноты покрытия района методом статистических
    испытаний (M*(n), D̃(n), σ̃(n), ε(β,n), пять обязательных графиков).
+3. «Модель объектов съёмки» — четыре закона пространственного размещения
+   целевых объектов (равномерно-случайное, групповое, регулярное, линейное),
+   визуализация, геометрические характеристики, экспорт GeoJSON/JSON
+   (sro_generator/target_model.py).
 
 Исследовательские стенды — в benchmarks/ (convergence_analysis.py,
 monte_carlo_convergence.py, cloud_coverage_analysis.py); вычислительные
@@ -27,6 +31,7 @@ import streamlit as st
 
 from sro_generator.config import ConfigError, ScenarioConfig
 from sro_generator.generator import generate_scenario
+from sro_generator.geometry import LocalCRS, build_district_polygon
 from sro_generator.monte_carlo import (
     classical_series,
     k_sweep,
@@ -36,6 +41,14 @@ from sro_generator.monte_carlo import (
     MonteCarloParams,
 )
 from sro_generator.placement import PlacementError
+from sro_generator.target_model import (
+    MODEL_TITLES_RU,
+    MODELS,
+    SpatialModelParams,
+    export_target_geojson,
+    generate_target_objects,
+    realization_metrics,
+)
 
 st.set_page_config(page_title="SRO Generator 2.0", layout="wide")
 st.title("SRO Generator 2.0 — генерация СРО и статистическое исследование досъёмки РСА")
@@ -225,7 +238,7 @@ def render_preview_cloud(scenario, hidden_flags, frames_selected, path, show_fra
     return path
 
 
-tab_gen, tab_stat = st.tabs(["Генерация СРО", "Статистическое исследование"])
+tab_gen, tab_stat, tab_model = st.tabs(["Генерация СРО", "Статистическое исследование", "Модель объектов съёмки"])
 
 # ---------------------------------------------------------------------------
 # Вкладка 1. Генерация СРО
@@ -451,4 +464,186 @@ with tab_stat:
             "M*(n) — статистическое математическое ожидание; D̃(n) — исправленная "
             "выборочная дисперсия (деление на n−1); σ̃(n) = √D̃; "
             "ε(β,n) = t(β,n−1)·σ̃(n)/√n; I = [M*−ε; M*+ε]. Данные не сглаживаются."
+        )
+
+# ---------------------------------------------------------------------------
+# Вкладка 3. Модель объектов съёмки
+# ---------------------------------------------------------------------------
+
+def render_target_preview(result, path):
+    """Район, объекты модели и структура закона (центры групп / линейные хорды)."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon as MplPolygon
+
+    fig, ax = plt.subplots(figsize=(10, 10))
+    dx, dy = result.district.exterior.xy
+    ax.plot(dx, dy, "k-", linewidth=1.5, label="Район")
+    for chord in result.line_chords:
+        cx, cy = chord.xy
+        ax.plot(cx, cy, color="0.4", linestyle="--", linewidth=1.2,
+                label="линейная структура" if chord is result.line_chords[0] else None)
+    for i, c in enumerate(result.cluster_centers):
+        ax.plot(c.x, c.y, marker="x", color="red", markersize=10, markeredgewidth=2.2,
+                label="центр группы" if i == 0 else None)
+    colors = plt.cm.tab20.colors
+    for i, o in enumerate(result.objects):
+        x, y = o.geometry.exterior.xy
+        face = colors[o.group_id % len(colors)] if o.group_id is not None else colors[i % len(colors)]
+        ax.add_patch(MplPolygon(list(zip(x, y)), closed=True, facecolor=face,
+                                edgecolor="black", linewidth=0.6, alpha=0.75,
+                                label="объект съёмки" if i == 0 else None))
+        ax.plot(o.center.x, o.center.y, "k+", markersize=5)
+    ax.set_aspect("equal")
+    ax.autoscale_view()
+    ax.set_xlabel("x, м (локальная СК)")
+    ax.set_ylabel("y, м (локальная СК)")
+    ax.set_title(f"{MODEL_TITLES_RU[result.params.model]} размещение, "
+                 f"{len(result.objects)} объектов")
+    ax.grid(True, alpha=0.3)
+    handles, lbls = ax.get_legend_handles_labels()
+    by_label = dict(zip(lbls, handles))
+    if by_label:
+        ax.legend(by_label.values(), by_label.keys(), fontsize=8, loc="upper right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+    return path
+
+
+with tab_model:
+    st.subheader("Модель объектов съёмки: законы пространственного размещения")
+    st.caption(
+        "Математическая модель пространственного распределения целевых объектов ДЗЗ "
+        "в районе (панель «Район» и «Объекты» слева). Четыре закона: равномерно-случайное, "
+        "групповое (кластерное), регулярное (решётка с дрожанием) и линейное (вдоль "
+        "пространственных структур). Объекты имеют геометрию, размеры, площадь и "
+        "координаты; соблюдаются границы района с отступом и минимальное расстояние; "
+        "реализация воспроизводима по seed."
+    )
+
+    law_labels = {m: MODEL_TITLES_RU[m] for m in MODELS}
+    tm_model = st.selectbox(
+        "Закон пространственного распределения", list(MODELS),
+        format_func=lambda m: law_labels[m], key="tm_model")
+    tc1, tc2, tc3 = st.columns(3)
+    tm_n_clusters = tc1.number_input("Число групп (кластерное)", value=5, min_value=1, step=1,
+                                     disabled=tm_model != "cluster")
+    tm_cluster_sigma = tc2.number_input("СКО группы, м (кластерное)", value=1500.0, min_value=1.0,
+                                        disabled=tm_model != "cluster")
+    tm_jitter = tc3.slider("Дрожание решётки (регулярное)", 0.0, 1.0, 0.6,
+                           disabled=tm_model != "regular")
+    tc4, tc5, _ = st.columns(3)
+    tm_n_lines = tc4.number_input("Число линейных структур", value=4, min_value=1, step=1,
+                                  disabled=tm_model != "linear")
+    tm_line_sigma = tc5.number_input("СКО поперечного отклонения, м (линейное)", value=400.0,
+                                     min_value=0.0, disabled=tm_model != "linear")
+
+    if st.button("Разместить объекты", type="primary", key="tm_run"):
+        local = LocalCRS(center_lat, center_lon)
+        district = build_district_polygon(local, width * 1000.0, height * 1000.0, rotation)
+        try:
+            tm_params = SpatialModelParams(
+                model=tm_model,
+                count=int(count),
+                vertices_min=int(vertices_min),
+                vertices_max=int(vertices_max),
+                area_min_m2=float(area_min),
+                area_max_m2=float(area_max),
+                irregularity=float(irregularity),
+                max_aspect_ratio=float(max_aspect),
+                rotation_min_deg=float(rot_min),
+                rotation_max_deg=float(rot_max),
+                boundary_margin_m=float(boundary_margin),
+                min_distance_m=float(min_distance),
+                n_clusters=int(tm_n_clusters),
+                cluster_sigma_m=float(tm_cluster_sigma),
+                jitter_fraction=float(tm_jitter),
+                n_lines=int(tm_n_lines),
+                line_sigma_m=float(tm_line_sigma),
+            )
+        except ValueError as exc:
+            st.error(f"Ошибка параметров: {exc}")
+            st.stop()
+        with st.spinner("Размещение объектов…"):
+            try:
+                tm_result = generate_target_objects(
+                    tm_params, district, np.random.default_rng(int(seed)))
+            except PlacementError as exc:
+                st.error(f"Ошибка размещения: {exc}")
+                st.stop()
+            tm_metrics = realization_metrics(tm_result)
+            tm_preview = render_target_preview(tm_result, "/tmp/sro_target_preview.png")
+        st.session_state["tm_result"] = tm_result
+        st.session_state["tm_metrics"] = tm_metrics
+        st.session_state["tm_preview"] = tm_preview
+        st.session_state["tm_local"] = local
+
+    tm_result = st.session_state.get("tm_result")
+    if tm_result is not None:
+        tm_metrics = st.session_state["tm_metrics"]
+        col_l, col_r = st.columns([3, 2])
+        with col_l:
+            st.image(st.session_state["tm_preview"],
+                     caption=f"{MODEL_TITLES_RU[tm_result.params.model]} размещение")
+        with col_r:
+            st.subheader("Сводка")
+            st.metric("Число объектов", tm_metrics["n_objects"])
+            st.metric("Плотность, объектов/км²", f"{tm_metrics['density_per_km2']:.3f}")
+            st.metric("Доля площади района", f"{tm_metrics['objects_area_fraction']:.4f}")
+            st.metric("Средняя площадь объекта, м²", f"{tm_metrics['objects_area_mean_m2']:,.0f}")
+            st.metric("Среднее расстояние до ближайшего соседа, м",
+                      f"{tm_metrics['nn_mean_m']:,.0f}")
+            st.metric("Индекс Кларка–Эванса R", f"{tm_metrics['ce_r']:.3f}")
+            st.metric("Индекс дисперсии квадрантов I", f"{tm_metrics['dispersion_index']:.3f}")
+            st.caption(
+                f"Диагностика реализации: R < 1 — группирование, R ≈ 1 — случайное, "
+                f"R > 1 — регулярное; I — то же по квадрантному счёту. "
+                f"χ²-критерий CSR: {'отвергается' if tm_metrics['quad_csr_rejected'] else 'не отвергается'} "
+                f"(χ² = {tm_metrics['quad_chi2']:.1f}, критические "
+                f"{tm_metrics['quad_chi2_low_crit']:.1f}…{tm_metrics['quad_chi2_high_crit']:.1f})."
+            )
+
+        st.subheader("Геометрические характеристики объектов")
+        st.dataframe(pd.DataFrame([
+            {
+                "object_id": o.object_id,
+                "group_id": o.group_id,
+                "area_m2": round(o.area_m2, 1),
+                "vertex_count": o.vertex_count,
+                "rotation_deg": round(o.rotation_deg, 2),
+                "center_x_m": round(o.center.x, 1),
+                "center_y_m": round(o.center.y, 1),
+            }
+            for o in tm_result.objects
+        ]))
+
+        import json as _json
+
+        fc = export_target_geojson(tm_result, st.session_state["tm_local"])
+        dc1, dc2, _ = st.columns(3)
+        dc1.download_button(
+            "Скачать objects.geojson",
+            _json.dumps(fc, ensure_ascii=False),
+            file_name="target_objects.geojson",
+            mime="application/geo+json",
+        )
+        dc2.download_button(
+            "Скачать параметры модели (JSON)",
+            _json.dumps({
+                "model": tm_result.params.model,
+                "model_title_ru": MODEL_TITLES_RU[tm_result.params.model],
+                "params": {k: v for k, v in vars(tm_result.params).items()},
+                "seed": int(seed),
+                "district": {
+                    "center_lat": center_lat, "center_lon": center_lon,
+                    "width_km": width, "height_km": height, "rotation_deg": rotation,
+                },
+                "metrics": {k: v for k, v in tm_metrics.items()
+                            if isinstance(v, (int, float, bool, str))},
+            }, ensure_ascii=False, indent=2),
+            file_name="target_model_params.json",
+            mime="application/json",
         )
