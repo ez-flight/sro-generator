@@ -119,6 +119,17 @@ class TestJointGeneration:
         for o in r.obstacles.objects:
             assert DISTRICT.covers(o.geometry)
 
+    def test_requested_count_is_exact_for_large_feasible_set(self):
+        """Регрессия: запрос 150 объектов не должен молча вернуть другое число."""
+        p = SpatialModelParams(
+            model="uniform", count=150,
+            area_min_m2=50_000.0, area_max_m2=300_000.0,
+            boundary_margin_m=100.0, min_distance_m=50.0,
+        )
+        r = generate_joint_model(p, None, DISTRICT, target_seed=42, obstacle_seed=7)
+        assert len(r.targets.objects) == 150
+        assert r.geometry.area_targets_m2 > 0.0
+
     def test_reproducibility(self):
         a = generate_joint_model(target_params(), obstacle_params(), DISTRICT, 5, 6)
         b = generate_joint_model(target_params(), obstacle_params(), DISTRICT, 5, 6)

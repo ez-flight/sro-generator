@@ -1,4 +1,4 @@
-"""Графический интерфейс SRO Generator 2.3.0 (Streamlit).
+"""Графический интерфейс SRO Generator 2.3.1 (Streamlit).
 
 Пять вкладок:
 1. «Генерация СРО» — настройка района и объектов, воспроизводимая генерация
@@ -69,8 +69,8 @@ from sro_generator.target_model import (
     sample_skewness,
 )
 
-st.set_page_config(page_title="SRO Generator 2.3", layout="wide")
-st.title("SRO Generator 2.3 — генерация СРО, пространственные модели и досъёмка РСА")
+st.set_page_config(page_title="SRO Generator 2.3.1", layout="wide")
+st.title("SRO Generator 2.3.1 — генерация СРО, пространственные модели и досъёмка РСА")
 
 with st.sidebar:
     st.header("Район")
@@ -898,7 +898,31 @@ with tab_joint:
     j_l_resh = jl4.checkbox("Досъёмка U", value=True, key="j_l_r")
     j_l_dist = jl5.checkbox("Район", value=True, key="j_l_d")
 
+    # Слои карты только меняют отрисовку. Изменение любого расчётного параметра
+    # обязано инвалидировать прежний результат, чтобы не показывать чужую
+    # геометрию (например, 25 объектов после смены count на 150).
+    j_controls = (
+        float(center_lat), float(center_lon), float(width), float(height), float(rotation),
+        int(count), int(vertices_min), int(vertices_max), float(area_min), float(area_max),
+        float(irregularity), float(rot_min), float(rot_max), float(max_aspect),
+        float(min_distance), float(boundary_margin), int(max_attempts),
+        str(j_law), int(j_seed_t), int(j_seed_b), int(j_n_clusters), float(j_sigma),
+        float(j_jitter), int(j_n_lines), bool(j_use_obstacles), str(j_b_law),
+        int(j_b_count), float(j_b_area_min), float(j_b_area_max),
+    )
+    if st.session_state.get("j_controls") != j_controls:
+        if st.session_state.get("j_result") is not None:
+            st.info("Параметры совместной модели изменились. Нажмите «Построить совместную модель».")
+        st.session_state["j_result"] = None
+        st.session_state["j_summary"] = None
+        st.session_state["j_local"] = None
+        st.session_state["j_controls"] = j_controls
+
     if st.button("Построить совместную модель", type="primary", key="j_run"):
+        # Не оставляем прежний результат при ошибке параметров/размещения.
+        st.session_state["j_result"] = None
+        st.session_state["j_summary"] = None
+        st.session_state["j_local"] = None
         local = LocalCRS(center_lat, center_lon)
         district = build_district_polygon(local, width * 1000.0, height * 1000.0, rotation)
         try:
@@ -909,6 +933,7 @@ with tab_joint:
                 irregularity=float(irregularity), max_aspect_ratio=float(max_aspect),
                 rotation_min_deg=float(rot_min), rotation_max_deg=float(rot_max),
                 boundary_margin_m=float(boundary_margin), min_distance_m=float(min_distance),
+                max_attempts_per_object=int(max_attempts),
                 n_clusters=int(j_n_clusters), cluster_sigma_m=float(j_sigma),
                 jitter_fraction=float(j_jitter), n_lines=int(j_n_lines), line_sigma_m=400.0,
             )
@@ -955,6 +980,7 @@ with tab_joint:
             st.image(str(j_map), caption="Совместная модель района ДЗЗ")
         with col_r:
             st.subheader("Геометрическая полнота")
+            st.metric("Сгенерировано объектов T", f"{j_summary['n_targets']}")
             st.metric("P_опт — оптическое покрытие объектов", f"{j_summary['p_opt']:.4f}")
             st.metric("P_скр — доля, требующая досъёмки РСА", f"{j_summary['p_skr']:.4f}")
             st.metric("S(T), км²", f"{j_summary['area_targets_m2'] / 1e6:.2f}")

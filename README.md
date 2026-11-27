@@ -1,4 +1,4 @@
-# SRO Generator 2.3
+# SRO Generator 2.3.1
 
 Программа создаёт синтетическую модель прямоугольного района съёмки со случайно
 расположенными площадными объектами и моделирует досъёмку объектов, недоступных
@@ -6,7 +6,7 @@
 Генерируется только геометрия и атрибуты сценария — не радиолокационные
 изображения, не орбитальная динамика и не расписание съёмки.
 
-Версия пакета: **2.3.0** (см. CHANGELOG.md, MIGRATION-1.0-TO-1.1.md, BENCHMARK-1.1.md,
+Версия пакета: **2.3.1** (см. CHANGELOG.md, MIGRATION-1.0-TO-1.1.md, BENCHMARK-1.1.md,
 CONVERGENCE-ANALYSIS.md, MONTE-CARLO-CONVERGENCE.md, CLOUD-COVERAGE-ANALYSIS.md,
 TARGET-OBJECT-DISTRIBUTION.md, TARGET-OBJECT-STATISTICS.md, JOINT-SPATIAL-MODEL.md).
 
