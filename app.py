@@ -1,6 +1,6 @@
-"""Графический интерфейс SRO Generator 2.1.0 (Streamlit).
+"""Графический интерфейс SRO Generator 2.3.0 (Streamlit).
 
-Три вкладки + вкладка статистического исследования объектов съёмки:
+Пять вкладок:
 1. «Генерация СРО» — настройка района и объектов, воспроизводимая генерация
    (seed), визуализация района, объектов, облачности и кадров досъёмки РСА,
    расчёт геометрической полноты покрытия (G — район, C — скрытые объекты).
@@ -15,10 +15,15 @@
    размещения: n независимых реализаций каждого закона, F*(r) с имитационным
    эталоном и кривой Рэлея, сравнение по R/I/R_b, сходимость M*(n), D̃(n),
    ε(β,n), две таблицы, шесть обязательных графиков (PNG/SVG).
+5. «Совместная модель района ДЗЗ» — объекты T и препятствия оптической
+   съёмке B на одном районе с независимыми seed; U = T ∩ B, P_опт, P_скр,
+   классификация видимости, карта слоёв и экспорт GeoJSON/JSON
+   (sro_generator/joint_model.py).
 
 Исследовательские стенды — в benchmarks/ (convergence_analysis.py,
 monte_carlo_convergence.py, cloud_coverage_analysis.py); вычислительные
-функции сохранены в sro_generator/convergence.py и sro_generator/monte_carlo.py.
+функции сохранены в sro_generator/convergence.py, sro_generator/monte_carlo.py
+и sro_generator/target_model.py.
 
 Запуск: streamlit run app.py
 """
@@ -45,6 +50,12 @@ from sro_generator.monte_carlo import (
     MonteCarloParams,
 )
 from sro_generator.placement import PlacementError
+from sro_generator.joint_model import (
+    export_joint_geojson,
+    generate_joint_model,
+    joint_summary,
+    render_joint_map,
+)
 from sro_generator.target_model import (
     MODEL_TITLES_RU,
     MODELS,
@@ -58,8 +69,8 @@ from sro_generator.target_model import (
     sample_skewness,
 )
 
-st.set_page_config(page_title="SRO Generator 2.0", layout="wide")
-st.title("SRO Generator 2.0 — генерация СРО и статистическое исследование досъёмки РСА")
+st.set_page_config(page_title="SRO Generator 2.3", layout="wide")
+st.title("SRO Generator 2.3 — генерация СРО, пространственные модели и досъёмка РСА")
 
 with st.sidebar:
     st.header("Район")
@@ -246,9 +257,9 @@ def render_preview_cloud(scenario, hidden_flags, frames_selected, path, show_fra
     return path
 
 
-tab_gen, tab_stat, tab_model, tab_model_stat = st.tabs(
+tab_gen, tab_stat, tab_model, tab_model_stat, tab_joint = st.tabs(
     ["Генерация СРО", "Статистическое исследование", "Модель объектов съёмки",
-     "Статистическое исследование объектов съёмки"])
+     "Статистическое исследование объектов съёмки", "Совместная модель района ДЗЗ"])
 
 # ---------------------------------------------------------------------------
 # Вкладка 1. Генерация СРО
@@ -832,3 +843,170 @@ with tab_model_stat:
                     zf.write(p, arcname=p.name)
         st.download_button("Скачать все графики (PNG + SVG, zip)", buf_png.getvalue(),
                            file_name="target_statistics_charts.zip", mime="application/zip")
+
+# ---------------------------------------------------------------------------
+# Вкладка 5. Совместная модель района ДЗЗ
+# ---------------------------------------------------------------------------
+with tab_joint:
+    st.subheader("Совместная стохастическая модель района ДЗЗ: целевые объекты T "
+                 "и препятствия оптической съёмке B")
+    st.caption(
+        "Объединение двух пространственных моделей на одном районе (панель «Район» слева) "
+        "с независимыми seed: объекты T — четыре закона размещения (как во вкладке «Модель "
+        "объектов съёмки»), препятствия B — поля облачности тем же ядром (пересечения полей "
+        "разрешены). Геометрия досъёмки: U = T ∩ B — участки, требующие РСА; "
+        "P_опт = S(T \\ B)/S(T) — исходная полнота оптического покрытия; "
+        "P_скр = S(T ∩ B)/S(T) — доля площади объектов, требующая досъёмки; "
+        "инвариант S(U) + S(T \\ B) = S(T) контролируется."
+    )
+
+    jc1, jc2, jc3 = st.columns(3)
+    j_law = jc1.selectbox("Закон объектов T", list(MODELS),
+                          format_func=lambda m: MODEL_TITLES_RU[m], key="j_law")
+    j_seed_t = jc2.number_input("Seed объектов", value=42, step=1, key="j_seed_t")
+    j_seed_b = jc3.number_input("Seed препятствий", value=7, step=1, key="j_seed_b")
+
+    jc4, jc5, jc6 = st.columns(3)
+    j_n_clusters = jc4.number_input("Групп (кластерный T)", value=5, min_value=1, step=1,
+                                    disabled=j_law != "cluster", key="j_nc")
+    j_sigma = jc5.number_input("СКО группы T, м", value=1500.0, min_value=1.0,
+                               disabled=j_law != "cluster", key="j_sig")
+    j_jitter = jc6.slider("Дрожание решётки T", 0.0, 1.0, 0.6,
+                          disabled=j_law != "regular", key="j_jit")
+    jc7, jc8, _ = st.columns(3)
+    j_n_lines = jc7.number_input("Линейных структур T", value=4, min_value=1, step=1,
+                                 disabled=j_law != "linear", key="j_nl")
+
+    st.markdown("**Препятствия B (поля облачности)**")
+    jb1, jb2, jb3, jb4 = st.columns(4)
+    j_use_obstacles = jb1.checkbox("Моделировать препятствия", value=True, key="j_use_b")
+    j_b_law = jb2.selectbox("Закон препятствий", list(MODELS), index=0,
+                            format_func=lambda m: MODEL_TITLES_RU[m],
+                            disabled=not j_use_obstacles, key="j_b_law")
+    j_b_count = jb3.number_input("Число полей B", value=8, min_value=1, step=1,
+                                 disabled=not j_use_obstacles, key="j_b_count")
+    j_b_area_min = jb4.number_input("Площадь поля мин, км²", value=20.0, min_value=0.1,
+                                    disabled=not j_use_obstacles, key="j_b_amin")
+    j_b_area_max = st.number_input("Площадь поля макс, км²", value=60.0, min_value=0.1,
+                                   disabled=not j_use_obstacles, key="j_b_amax")
+
+    st.markdown("**Слои карты**")
+    jl1, jl2, jl3, jl4, jl5 = st.columns(5)
+    j_l_obst = jl1.checkbox("Препятствия", value=True, key="j_l_b")
+    j_l_obj = jl2.checkbox("Контуры объектов", value=True, key="j_l_o")
+    j_l_vis = jl3.checkbox("Видимая часть", value=True, key="j_l_v")
+    j_l_resh = jl4.checkbox("Досъёмка U", value=True, key="j_l_r")
+    j_l_dist = jl5.checkbox("Район", value=True, key="j_l_d")
+
+    if st.button("Построить совместную модель", type="primary", key="j_run"):
+        local = LocalCRS(center_lat, center_lon)
+        district = build_district_polygon(local, width * 1000.0, height * 1000.0, rotation)
+        try:
+            j_t_params = SpatialModelParams(
+                model=j_law, count=int(count),
+                vertices_min=int(vertices_min), vertices_max=int(vertices_max),
+                area_min_m2=float(area_min), area_max_m2=float(area_max),
+                irregularity=float(irregularity), max_aspect_ratio=float(max_aspect),
+                rotation_min_deg=float(rot_min), rotation_max_deg=float(rot_max),
+                boundary_margin_m=float(boundary_margin), min_distance_m=float(min_distance),
+                n_clusters=int(j_n_clusters), cluster_sigma_m=float(j_sigma),
+                jitter_fraction=float(j_jitter), n_lines=int(j_n_lines), line_sigma_m=400.0,
+            )
+            j_b_params = None
+            if j_use_obstacles:
+                if j_b_area_min > j_b_area_max:
+                    st.error("Площадь поля мин не может превышать макс.")
+                    st.stop()
+                j_b_params = SpatialModelParams(
+                    model=j_b_law, count=int(j_b_count),
+                    vertices_min=6, vertices_max=10,
+                    area_min_m2=float(j_b_area_min) * 1e6,
+                    area_max_m2=float(j_b_area_max) * 1e6,
+                    irregularity=0.5, max_aspect_ratio=2.5,
+                    boundary_margin_m=0.0, allow_overlap=True,
+                    n_clusters=min(3, int(j_b_count)), cluster_sigma_m=3000.0,
+                    jitter_fraction=0.6, n_lines=3, line_sigma_m=1500.0,
+                )
+        except ValueError as exc:
+            st.error(f"Ошибка параметров: {exc}")
+            st.stop()
+        with st.spinner("Генерация совместной модели и геометрическое пересечение…"):
+            try:
+                j_result = generate_joint_model(
+                    j_t_params, j_b_params, district,
+                    target_seed=int(j_seed_t), obstacle_seed=int(j_seed_b))
+            except PlacementError as exc:
+                st.error(f"Ошибка размещения: {exc}")
+                st.stop()
+            j_summary = joint_summary(j_result)
+        st.session_state["j_result"] = j_result
+        st.session_state["j_summary"] = j_summary
+        st.session_state["j_local"] = local
+
+    j_result = st.session_state.get("j_result")
+    if j_result is not None:
+        j_summary = st.session_state["j_summary"]
+        j_map = render_joint_map(
+            j_result, "/tmp/sro_joint_map.png",
+            layers={"district": j_l_dist, "obstacles": j_l_obst, "objects": j_l_obj,
+                    "visible": j_l_vis, "reshoot": j_l_resh})
+        col_l, col_r = st.columns([3, 2])
+        with col_l:
+            st.image(str(j_map), caption="Совместная модель района ДЗЗ")
+        with col_r:
+            st.subheader("Геометрическая полнота")
+            st.metric("P_опт — оптическое покрытие объектов", f"{j_summary['p_opt']:.4f}")
+            st.metric("P_скр — доля, требующая досъёмки РСА", f"{j_summary['p_skr']:.4f}")
+            st.metric("S(T), км²", f"{j_summary['area_targets_m2'] / 1e6:.2f}")
+            st.metric("S(U) = S(T ∩ B), км²", f"{j_summary['area_reshoot_m2'] / 1e6:.2f}")
+            st.metric("S(T \\ B), км²", f"{j_summary['area_visible_m2'] / 1e6:.2f}")
+            c = j_summary["counts"]
+            st.metric("Объекты: видимые / частичные / скрытые",
+                      f"{c['visible']} / {c['partial']} / {c['hidden']}")
+            st.caption(
+                f"Инвариант P_опт + P_скр = 1: "
+                f"{'выполнен' if j_summary['area_identity_ok'] else 'НАРУШЕН'}. "
+                f"Препятствий B: {j_summary['n_obstacles']} "
+                f"(seed {j_summary['obstacle_seed']}); объекты T — seed "
+                f"{j_summary['target_seed']} (независимы)."
+            )
+
+        st.subheader("Геометрические характеристики объектов")
+        st.dataframe(pd.DataFrame([
+            {
+                "object_id": r["object_id"],
+                "area_m2": round(r["area_m2"], 1),
+                "hidden_area_m2": round(r["hidden_area_m2"], 1),
+                "hidden_fraction": round(r["hidden_fraction"], 4),
+                "статус": {"visible": "видим", "partial": "частично скрыт",
+                           "hidden": "скрыт"}[r["status"]],
+            }
+            for r in j_summary["per_object"]
+        ]))
+
+        import json as _json2
+
+        j_layers = export_joint_geojson(j_result, st.session_state["j_local"])
+        jd1, jd2, jd3 = st.columns(3)
+        buf_j = io.BytesIO()
+        import zipfile as _zipfile
+
+        with _zipfile.ZipFile(buf_j, "w", _zipfile.ZIP_DEFLATED) as zf:
+            for name, fc in j_layers.items():
+                zf.writestr(f"joint_{name}.geojson",
+                            _json2.dumps(fc, ensure_ascii=False))
+        jd1.download_button("Скачать GeoJSON-слои (zip)", buf_j.getvalue(),
+                            file_name="joint_model_geojson.zip", mime="application/zip")
+        jd2.download_button("Скачать сводку (JSON)",
+                            _json2.dumps({k: v for k, v in j_summary.items()},
+                                         ensure_ascii=False, indent=2),
+                            file_name="joint_model_summary.json", mime="application/json")
+        with open(j_map, "rb") as f:
+            jd3.download_button("Скачать карту (PNG)", f.read(),
+                                file_name="joint_model_map.png", mime="image/png")
+        st.caption(
+            "GeoJSON (RFC 7946, WGS 84): слои district (граница района), objects "
+            "(объекты T со статусом и долей скрытой площади), obstacles (препятствия B), "
+            "reshoot (полигоны участков U = T ∩ B для планирования РСА-досъёмки в plane_sar), "
+            "visible (видимая оптике часть T \\ B)."
+        )

@@ -1,4 +1,4 @@
-# SRO Generator 2.2
+# SRO Generator 2.3
 
 Программа создаёт синтетическую модель прямоугольного района съёмки со случайно
 расположенными площадными объектами и моделирует досъёмку объектов, недоступных
@@ -6,11 +6,11 @@
 Генерируется только геометрия и атрибуты сценария — не радиолокационные
 изображения, не орбитальная динамика и не расписание съёмки.
 
-Версия пакета: **2.2.0** (см. CHANGELOG.md, MIGRATION-1.0-TO-1.1.md, BENCHMARK-1.1.md,
+Версия пакета: **2.3.0** (см. CHANGELOG.md, MIGRATION-1.0-TO-1.1.md, BENCHMARK-1.1.md,
 CONVERGENCE-ANALYSIS.md, MONTE-CARLO-CONVERGENCE.md, CLOUD-COVERAGE-ANALYSIS.md,
-TARGET-OBJECT-DISTRIBUTION.md, TARGET-OBJECT-STATISTICS.md).
+TARGET-OBJECT-DISTRIBUTION.md, TARGET-OBJECT-STATISTICS.md, JOINT-SPATIAL-MODEL.md).
 
-## Интерфейс (четыре вкладки)
+## Интерфейс (пять вкладок)
 
 **«Генерация СРО»** — настройка района и случайных объектов, воспроизводимая
 генерация (seed), визуализация геометрии района, объектов, облачности
@@ -52,12 +52,24 @@ M*(n)/D̃(n)/σ̃(n)/ε(β,n) по N независимым реализация
 испытаний. Две таблицы (исходные параметры; результаты оценивания с
 асимметрией и долями отклонений CSR), экспорт графиков PNG/SVG.
 
+**«Совместная модель района ДЗЗ»** — объединение объектов наблюдения T и
+препятствий оптической съёмке B на одном районе с независимыми seed (отчёт
+JOINT-SPATIAL-MODEL.md). Объекты T размещаются по любому из четырёх законов;
+препятствия B — поля облачности тем же ядром, перекрытия полей разрешены.
+Точные геометрические операции формируют участки досъёмки РСА U = T ∩ B,
+видимую часть T \ B, метрики P_опт = S(T \ B)/S(T) и P_скр = S(T ∩ B)/S(T)
+и классификацию объектов (видимые, частично скрытые, полностью скрытые).
+Интерактивная карта имеет переключаемые слои района, препятствий, контуров
+объектов, видимой части и досъёмки; экспортируются GeoJSON-слои
+`district`, `objects`, `obstacles`, `reshoot`, `visible` и JSON-сводка —
+вход для дальнейшего планирования в `plane_sar`.
+
 Исследовательские стенды — `benchmarks/convergence_analysis.py` (1.2.0),
 `benchmarks/monte_carlo_convergence.py` (1.3.0), `benchmarks/cloud_coverage_analysis.py`
 (1.3.0), `benchmarks/target_distribution_study.py` (2.1.0),
 `benchmarks/target_statistics_study.py` (2.2.0); вычислительные
 модули — `sro_generator/convergence.py`, `sro_generator/monte_carlo.py`,
-`sro_generator/target_model.py`.
+`sro_generator/target_model.py`, `sro_generator/joint_model.py`.
 
 ## Установка
 

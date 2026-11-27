@@ -97,7 +97,10 @@ class SpatialModelParams:
     - ``max_aspect_ratio`` — предельное отношение сторон (больше 1);
     - ``boundary_margin_m`` — отступ полигонов от границы района;
     - ``min_distance_m`` — минимальное расстояние между полигонами (≥ 0);
-    - ``max_attempts_per_object`` — предел попыток размещения одного объекта.
+    - ``max_attempts_per_object`` — предел попыток размещения одного объекта;
+    - ``allow_overlap`` — разрешить пересечения полигонов по площади
+      (False по умолчанию; True используется для полей препятствий-облаков,
+      которые физически могут сливаться; см. ``joint_model``).
 
     Закон размещения — ``model`` ∈ {uniform, cluster, regular, linear}:
     - ``cluster``: ``n_clusters`` — число групп, ``cluster_sigma_m`` — СКО
@@ -121,6 +124,7 @@ class SpatialModelParams:
     boundary_margin_m: float = 100.0
     min_distance_m: float = 0.0
     max_attempts_per_object: int = 10_000
+    allow_overlap: bool = False
     n_clusters: int = 5
     cluster_sigma_m: float = 1_500.0
     jitter_fraction: float = 0.6
@@ -343,7 +347,8 @@ def generate_target_objects(
                 continue
             conflict = False
             for other in placed:
-                if not pair_placement_ok(shifted, other.geometry, p.min_distance_m, False, 0.0):
+                if not pair_placement_ok(shifted, other.geometry, p.min_distance_m,
+                                         p.allow_overlap, 1.0 if p.allow_overlap else 0.0):
                     conflict = True
                     break
             if conflict:
