@@ -78,13 +78,18 @@ __all__ = [
     "export_target_geojson",
     "nn_distance_sample",
     "collect_nn_samples",
+    "curve_coordinate_stats",
+    "uniform_ks_stat",
+    "run_curved_line_study",
+    "write_curved_line_csv",
+    "write_curved_line_json",
     "sample_skewness",
     "rayleigh_cdf",
     "render_statistics_charts",
 ]
 
-# MODELS — четыре базовых закона статистических вкладок; curved добавлен как
-# расширение линейного закона только в вкладку «Модель объектов съёмки».
+# MODELS — четыре исторических базовых закона; curved добавлен как пятый закон
+# в статистическое исследование (TARGET_MODELS) и как расширение линейного закона.
 MODELS = ("uniform", "cluster", "regular", "linear")
 CURVED_MODEL = "curved"
 TARGET_MODELS = MODELS + (CURVED_MODEL,)
@@ -691,6 +696,115 @@ def quadrant_stats(
     }
 
 
+def uniform_ks_stat(values, lo: float = 0.0, hi: float = 1.0) -> dict:
+    """Статистика Колмогорова–Смирнова против равномерного распределения U[lo, hi].
+
+    Возвращает D, приближённый 5 %-й критический уровень 1,358/√n и флаг
+    отклонения. Без p-value: для испытаний с ограничениями размещения это
+    диагностика отклонения, а не строгий независимый критерий.
+    """
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    n = int(arr.size)
+    if n < 2:
+        raise ValueError("uniform_ks_stat: нужно не менее 2 значений.")
+    if not hi > lo:
+        raise ValueError("uniform_ks_stat: верхняя граница должна быть больше нижней.")
+    x = np.sort((arr - lo) / (hi - lo))
+    d = float(max(
+        np.max(np.arange(1, n + 1) / n - x),
+        np.max(x - np.arange(0, n) / n),
+    ))
+    crit = 1.35810 / math.sqrt(n)
+    return {"ks": d, "ks_crit": crit, "ks_rejected": bool(d > crit)}
+
+
+def curve_coordinate_stats(result: TargetModelResult, bins: int = 10) -> dict:
+    """Координаты центров объекта относительно кривой и проверки распределений.
+
+    Для ``model="curved"`` по сохранённой осевой линии вычисляются:
+    - нормированная дуговая координата s/L ∈ [0, 1] и её KS-статистика против
+      равномерного распределения;
+    - χ²-проверка равномерности по ``bins`` равным интервалам длины;
+    - знаковое и абсолютное поперечное отклонение от кривой, KS/χ² против
+      U[−w/2, w/2] (при w > 0).
+
+    Ограничения размещения (границы, минимальные расстояния, запрет пересечений)
+    сохраняются в реализации, поэтому проверки характеризуют фактическое
+    условное распределение реализуемых конфигураций, а не только идеальный
+    генератор кандидатов.
+    """
+    if result.params.model != "curved" or not result.line_chords:
+        raise ValueError("curve_coordinate_stats: нужен результат модели curved с осевой линией.")
+    if bins < 2:
+        raise ValueError("curve_coordinate_stats: bins должно быть не меньше 2.")
+    curve = result.line_chords[0]
+    length = float(curve.length)
+    if length <= 0.0:
+        raise ValueError("curve_coordinate_stats: пустая осевая линия.")
+    width = float(result.params.curve_width_m)
+    half = 0.5 * width
+    delta = max(1e-3, length * 1e-3)
+    along: list[float] = []
+    lateral: list[float] = []
+    for obj in result.objects:
+        s = float(curve.project(obj.center))
+        along.append(min(max(s / length, 0.0), 1.0))
+        proj = curve.interpolate(s)
+        a = curve.interpolate(max(0.0, s - delta))
+        b = curve.interpolate(min(length, s + delta))
+        tx, ty = b.x - a.x, b.y - a.y
+        norm = math.hypot(tx, ty)
+        if norm <= 0.0:
+            lateral.append(0.0)
+            continue
+        # Левый нормаль к локальному касательному направлению; знак условен,
+        # важна симметрия |offset| и распределение расстояний.
+        lateral.append((obj.center.x - proj.x) * (-ty / norm) +
+                       (obj.center.y - proj.y) * (tx / norm))
+
+    a_arr = np.asarray(along, dtype=float)
+    l_arr = np.asarray(lateral, dtype=float)
+    along_ks = uniform_ks_stat(a_arr)
+    expected = a_arr.size / bins
+    counts, _ = np.histogram(a_arr, bins=bins, range=(0.0, 1.0))
+    along_chi2 = float(((counts - expected) ** 2 / expected).sum())
+    along_crit = chi2_quantile(0.95, bins - 1)
+
+    if width > 0.0:
+        lateral_norm = (l_arr + half) / width
+        lateral_ks = uniform_ks_stat(lateral_norm)
+        expected = l_arr.size / bins
+        counts, _ = np.histogram(lateral_norm, bins=bins, range=(0.0, 1.0))
+        lateral_chi2 = float(((counts - expected) ** 2 / expected).sum())
+        lateral_crit = chi2_quantile(0.95, bins - 1)
+    else:
+        lateral_ks = {"ks": 0.0, "ks_crit": math.nan, "ks_rejected": False}
+        lateral_chi2 = 0.0
+        lateral_crit = math.nan
+
+    return {
+        "curve_length_m": length,
+        "along_mean": float(a_arr.mean()),
+        "along_std": float(a_arr.std(ddof=1)) if a_arr.size > 1 else 0.0,
+        "along_ks": along_ks["ks"],
+        "along_ks_crit": along_ks["ks_crit"],
+        "along_ks_rejected": along_ks["ks_rejected"],
+        "along_chi2": along_chi2,
+        "along_chi2_crit": along_crit,
+        "along_chi2_rejected": bool(along_chi2 > along_crit),
+        "lateral_mean_m": float(l_arr.mean()),
+        "lateral_std_m": float(l_arr.std(ddof=1)) if l_arr.size > 1 else 0.0,
+        "lateral_abs_mean_m": float(np.abs(l_arr).mean()),
+        "lateral_ks": lateral_ks["ks"],
+        "lateral_ks_crit": lateral_ks["ks_crit"],
+        "lateral_ks_rejected": lateral_ks["ks_rejected"],
+        "lateral_chi2": lateral_chi2,
+        "lateral_chi2_crit": lateral_crit,
+        "lateral_chi2_rejected": bool(lateral_chi2 > lateral_crit),
+    }
+
+
 def realization_metrics(result: TargetModelResult, grid: int = 5) -> dict:
     """Все пространственные характеристики одной реализации модели."""
     objs = result.objects
@@ -702,7 +816,7 @@ def realization_metrics(result: TargetModelResult, grid: int = 5) -> dict:
     nn = nearest_neighbor_stats(centers, area_district, boundary=result.district)
     quad = quadrant_stats(centers, result.district, grid=grid)
     areas = np.array([o.area_m2 for o in objs], dtype=float)
-    return {
+    metrics = {
         "model": result.params.model,
         "n_objects": len(objs),
         "density_per_km2": len(objs) / (area_district / 1e6),
@@ -713,6 +827,9 @@ def realization_metrics(result: TargetModelResult, grid: int = 5) -> dict:
         "dispersion_index": quad["dispersion_index"],
         **{f"quad_{k}": v for k, v in quad.items() if k != "dispersion_index"},
     }
+    if result.params.model == "curved":
+        metrics.update(curve_coordinate_stats(result))
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +852,24 @@ _STUDY_METRIC_TITLES_RU = {
     "objects_area_fraction": "Доля площади района, занятая объектами",
 }
 
+_CURVE_STUDY_METRICS = (
+    "nn_mean_m",
+    "ce_r",
+    "dispersion_index",
+    "nn_bearing_r",
+    "along_ks",
+    "lateral_abs_mean_m",
+)
+
+_CURVE_STUDY_METRIC_TITLES_RU = {
+    "nn_mean_m": "Среднее расстояние до ближайшего соседа, м",
+    "ce_r": "Индекс Кларка–Эванса R",
+    "dispersion_index": "Индекс дисперсии квадрантного счёта I",
+    "nn_bearing_r": "Результирующая длина направлений к ближайшему соседу",
+    "along_ks": "KS-статистика равномерности вдоль кривой",
+    "lateral_abs_mean_m": "Среднее |поперечное отклонение|, м",
+}
+
 
 def run_target_model_study(
     params: SpatialModelParams,
@@ -743,7 +878,7 @@ def run_target_model_study(
     seed_start: int = 0,
     beta: float = 0.95,
     grid: int = 5,
-    models: tuple[str, ...] = MODELS,
+    models: tuple[str, ...] = TARGET_MODELS,
     progress=None,
 ) -> dict:
     """Независимые статистические испытания законов размещения.
@@ -812,6 +947,12 @@ def run_target_model_study(
             "csr_chi2_reject_share": chi2_reject / realizations,
         }
 
+    curve_classical: dict[str, list[dict]] = {}
+    if "curved" in per_model:
+        for metric in _CURVE_STUDY_METRICS:
+            curve_classical[metric] = classical_series(
+                [r[metric] for r in per_model["curved"]["runs"]], beta=beta)
+
     return {
         "version": __version__,
         "mode": "target_object_distribution",
@@ -823,6 +964,9 @@ def run_target_model_study(
         "district_area_m2": float(district.area),
         "metrics": list(_STUDY_METRICS),
         "metric_titles_ru": dict(_STUDY_METRIC_TITLES_RU),
+        "curve_metrics": list(_CURVE_STUDY_METRICS),
+        "curve_metric_titles_ru": dict(_CURVE_STUDY_METRIC_TITLES_RU),
+        "curve_classical": curve_classical,
         "per_model": per_model,
         "warnings": warnings,
         "note": (
@@ -853,6 +997,9 @@ def write_target_csv(study: dict, out_dir: str | Path) -> dict[str, Path]:
         "ce_r", "ce_z", "nn_bearing_r",
         "quad_mean_count", "quad_var_count", "dispersion_index",
         "quad_chi2", "quad_csr_rejected", "quad_pattern",
+        "curve_length_m", "along_ks", "along_chi2", "along_chi2_rejected",
+        "lateral_mean_m", "lateral_std_m", "lateral_abs_mean_m",
+        "lateral_ks", "lateral_chi2", "lateral_chi2_rejected",
     ]
     with runs_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -1105,7 +1252,7 @@ def nn_distance_sample(result: TargetModelResult) -> np.ndarray:
 def collect_nn_samples(
     params: SpatialModelParams,
     district: Polygon,
-    models: tuple[str, ...] = MODELS,
+    models: tuple[str, ...] = TARGET_MODELS,
     realizations: int = 100,
     seed_start: int = 0,
     progress=None,
@@ -1147,6 +1294,209 @@ def collect_nn_samples(
                 progress(done, total)
         out[model] = np.concatenate(pooled) if pooled else np.empty(0, dtype=float)
     return out
+
+
+def run_curved_line_study(
+    params: SpatialModelParams,
+    district: Polygon,
+    bend_values=(0.0, 1_500.0, 3_000.0),
+    realizations: int = 100,
+    seed_start: int = 0,
+    beta: float = 0.95,
+    bins: int = 10,
+    grid: int = 5,
+    progress=None,
+) -> dict:
+    """Исследование криволинейного закона при серии значений извилистости.
+
+    Для каждого ``bend_values`` выполняется ``realizations`` независимых
+    реализуемых реализаций (одинаковый набор seed для всех извилистостей —
+    спаренное сравнение). По каждой реализации считаются общие пространственные
+    индексы и диагностики кривой (равномерность вдоль длины, поперечное
+    отклонение). Для каждой извилистости строятся классические оценки
+    M*(n), D̃(n), σ̃(n), ε(β,n) при фиксированном β (по умолчанию 0,95).
+    """
+    if params.model != "curved":
+        params = SpatialModelParams(**{**asdict(params), "model": "curved"})
+    if realizations < 3:
+        raise ValueError("run_curved_line_study: нужно не менее 3 реализаций.")
+    if beta not in BETAS:
+        raise ValueError(f"run_curved_line_study: β должна быть одной из {BETAS}.")
+    if bins < 2:
+        raise ValueError("run_curved_line_study: bins должно быть не меньше 2.")
+    bends = [float(v) for v in bend_values]
+    if not bends or any(v < 0.0 for v in bends):
+        raise ValueError("run_curved_line_study: извилистость должна быть неотрицательной.")
+
+    per_bend: list[dict] = []
+    warnings: list[str] = []
+    done = 0
+    total = realizations * len(bends)
+    for bend in bends:
+        p = SpatialModelParams(**{**asdict(params), "model": "curved", "curve_bend_m": bend})
+        runs: list[dict] = []
+        retries_total = 0
+        for i in range(realizations):
+            seed_used = seed_start + i
+            for _ in range(100):
+                rng = np.random.default_rng(np.random.SeedSequence([seed_used, 20261126, 17]))
+                try:
+                    result = generate_target_objects(p, district, rng)
+                    break
+                except PlacementError:
+                    seed_used += 1
+                    retries_total += 1
+            else:
+                raise PlacementError(
+                    f"run_curved_line_study: извилистость {bend:g}, реализация {i}: "
+                    "не удалось получить реализуемую конфигурацию за 100 попыток."
+                )
+            metrics = realization_metrics(result, grid=grid)
+            metrics["seed_used"] = seed_used
+            runs.append(metrics)
+            done += 1
+            if progress:
+                progress(done, total)
+        if retries_total:
+            warnings.append(
+                f"Извилистость {bend:g} м: {retries_total} повторов генерации "
+                "(условное распределение реализуемых конфигураций)."
+            )
+        classical: dict[str, list[dict]] = {}
+        for metric in _CURVE_STUDY_METRICS:
+            classical[metric] = classical_series([r[metric] for r in runs], beta=beta)
+        per_bend.append({
+            "bend_m": bend,
+            "params": asdict(p),
+            "runs": runs,
+            "classical": classical,
+            "uniformity": {
+                "curve_length_mean_m": float(np.mean([r["curve_length_m"] for r in runs])),
+                "along_ks_mean": float(np.mean([r["along_ks"] for r in runs])),
+                "along_ks_max": float(np.max([r["along_ks"] for r in runs])),
+                "along_ks_reject_share": float(np.mean([r["along_ks_rejected"] for r in runs])),
+                "along_chi2_reject_share": float(np.mean([r["along_chi2_rejected"] for r in runs])),
+                "lateral_mean_m": float(np.mean([r["lateral_mean_m"] for r in runs])),
+                "lateral_std_m": float(np.mean([r["lateral_std_m"] for r in runs])),
+                "lateral_std_theory_m": p.curve_width_m / math.sqrt(12.0) if p.curve_width_m > 0 else 0.0,
+                "lateral_abs_mean_m": float(np.mean([r["lateral_abs_mean_m"] for r in runs])),
+                "lateral_abs_mean_theory_m": p.curve_width_m / 4.0 if p.curve_width_m > 0 else 0.0,
+                "lateral_ks_mean": float(np.mean([r["lateral_ks"] for r in runs])),
+                "lateral_ks_reject_share": float(np.mean([r["lateral_ks_rejected"] for r in runs])),
+                "lateral_chi2_reject_share": float(np.mean([r["lateral_chi2_rejected"] for r in runs])),
+            },
+        })
+
+    return {
+        "version": __version__,
+        "mode": "curved_line_statistics",
+        "realizations": realizations,
+        "seed_start": seed_start,
+        "beta": beta,
+        "bins": bins,
+        "grid": grid,
+        "district_area_m2": float(district.area),
+        "metrics": list(_CURVE_STUDY_METRICS),
+        "metric_titles_ru": dict(_CURVE_STUDY_METRIC_TITLES_RU),
+        "per_bend": per_bend,
+        "warnings": warnings,
+        "note": (
+            "Проверки сопоставляют фактические реализации после ограничений "
+            "размещения: границы, минимальные расстояния и запрет пересечений "
+            "могут усечь коридор и изменить исходные равномерные распределения."
+        ),
+    }
+
+
+def write_curved_line_csv(study: dict, out_dir: str | Path) -> dict[str, Path]:
+    """CSV-выгрузка исследования криволинейного закона для статьи/диссертации."""
+    import csv
+    from pathlib import Path
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, Path] = {}
+
+    fields = [
+        "bend_m", "realization", "seed_used", "curve_length_m",
+        "nn_mean_m", "ce_r", "dispersion_index", "nn_bearing_r",
+        "along_ks", "along_chi2", "along_chi2_rejected",
+        "lateral_mean_m", "lateral_std_m", "lateral_abs_mean_m",
+        "lateral_ks", "lateral_chi2", "lateral_chi2_rejected",
+    ]
+    runs_path = out / "curved_line_runs.csv"
+    with runs_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for item in study["per_bend"]:
+            for i, r in enumerate(item["runs"]):
+                writer.writerow({
+                    "bend_m": item["bend_m"],
+                    "realization": i,
+                    **{k: (round(r[k], 10) if isinstance(r.get(k), float) else r.get(k))
+                       for k in fields if k not in ("bend_m", "realization")},
+                })
+    paths[runs_path.name] = runs_path
+
+    summary_path = out / "curved_line_summary.csv"
+    with summary_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "bend_m", "metric", "n", "m_star", "d_tilde", "sigma_tilde",
+            "epsilon", "ci_low", "ci_high",
+        ])
+        writer.writeheader()
+        for item in study["per_bend"]:
+            for metric in study["metrics"]:
+                last = item["classical"][metric][-1]
+                writer.writerow({
+                    "bend_m": item["bend_m"], "metric": metric,
+                    "n": last["n"], "m_star": round(last["m_star"], 10),
+                    "d_tilde": round(last["d_tilde"], 12),
+                    "sigma_tilde": round(last["sigma_tilde"], 10),
+                    "epsilon": round(last["epsilon"], 10),
+                    "ci_low": round(last["ci_low"], 10),
+                    "ci_high": round(last["ci_high"], 10),
+                })
+    paths[summary_path.name] = summary_path
+
+    uniform_path = out / "curved_line_uniformity.csv"
+    uniform_fields = [
+        "bend_m", "curve_length_mean_m", "along_ks_mean", "along_ks_max",
+        "along_ks_reject_share", "along_chi2_reject_share",
+        "lateral_mean_m", "lateral_std_m", "lateral_std_theory_m",
+        "lateral_abs_mean_m", "lateral_abs_mean_theory_m",
+        "lateral_ks_mean", "lateral_ks_reject_share", "lateral_chi2_reject_share",
+    ]
+    with uniform_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=uniform_fields)
+        writer.writeheader()
+        for item in study["per_bend"]:
+            writer.writerow({"bend_m": item["bend_m"], **item["uniformity"]})
+    paths[uniform_path.name] = uniform_path
+    return paths
+
+
+def write_curved_line_json(study: dict, out_dir: str | Path) -> Path:
+    """JSON-выгрузка исследования криволинейного закона."""
+    import json
+    from pathlib import Path
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "curved_line_statistics.json"
+
+    def _default(o):
+        if isinstance(o, (np.bool_,)):
+            return bool(o)
+        if isinstance(o, (np.floating,)):
+            return float(o)
+        if isinstance(o, (np.integer,)):
+            return int(o)
+        raise TypeError(f"Не сериализуется в JSON: {o.__class__.__name__}")
+
+    path.write_text(json.dumps(study, ensure_ascii=False, indent=2, default=_default),
+                    encoding="utf-8")
+    return path
 
 
 def sample_skewness(values) -> float:
@@ -1196,7 +1546,8 @@ def render_statistics_charts(
 ) -> dict[str, list[Path]]:
     """Шесть обязательных научных графиков исследования законов размещения.
 
-    1 — реализации четырёх законов (единый масштаб, район и число объектов);
+    1 — реализации пяти законов (четыре базовых и криволинейный; единый масштаб,
+        район и число объектов);
     2 — эмпирические F*(r) расстояний до ближайшего соседа: по каждому закону
         эмпирика (испытания), независимый имитационный эталон и аналитическая
         кривая Рэлея для CSR;
@@ -1232,7 +1583,7 @@ def render_statistics_charts(
             paths[name].append(p)
         plt.close(fig)
 
-    # --- График 1: реализации четырёх законов ---------------------------------
+    # --- График 1: реализации пяти законов ------------------------------------
     fig, axes = plt.subplots(1, len(models), figsize=(5.2 * len(models), 5.6))
     if len(models) == 1:
         axes = [axes]

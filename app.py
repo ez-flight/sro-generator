@@ -1,4 +1,4 @@
-"""Графический интерфейс SRO Generator 2.4.0 (Streamlit).
+"""Графический интерфейс SRO Generator 2.5.0 (Streamlit).
 
 Пять вкладок:
 1. «Генерация СРО» — настройка района и объектов, воспроизводимая генерация
@@ -35,6 +35,7 @@ import io
 import json
 import os
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -69,12 +70,15 @@ from sro_generator.target_model import (
     load_curve_geojson,
     realization_metrics,
     render_statistics_charts,
+    run_curved_line_study,
     run_target_model_study,
     sample_skewness,
+    write_curved_line_csv,
+    write_curved_line_json,
 )
 
-st.set_page_config(page_title="SRO Generator 2.4", layout="wide")
-st.title("SRO Generator 2.4 — генерация СРО, пространственные модели и досъёмка РСА")
+st.set_page_config(page_title="SRO Generator 2.5", layout="wide")
+st.title("SRO Generator 2.5 — генерация СРО, пространственные модели и досъёмка РСА")
 
 with st.sidebar:
     st.header("Район")
@@ -136,6 +140,17 @@ with st.sidebar:
         value=min(4, os.cpu_count() or 1),
         min_value=1, max_value=32, step=1,
     )
+
+
+def parse_float_list(text: str, name: str) -> list[float]:
+    """Разобрать список вещественных чисел через запятую/пробел."""
+    parts = [p for p in text.replace(",", " ").split() if p]
+    if not parts:
+        raise ValueError(f"{name}: список не должен быть пустым.")
+    try:
+        return [float(p) for p in parts]
+    except ValueError as exc:
+        raise ValueError(f"{name}: все элементы должны быть числами.") from exc
 
 
 def parse_manual_centers(df) -> tuple[list[dict], list[str]]:
@@ -735,12 +750,14 @@ with tab_model_stat:
     st.caption(
         "Одно статистическое испытание — одна независимая реализация пространственного "
         "распределения объектов (модель — вкладка «Модель объектов съёмки», район и объекты — "
-        "панель слева). Исследование: n независимых реализаций каждого из четырёх законов; "
-        "классические оценки M*(n), D̃(n), σ̃(n), ε(β,n) и доверительные интервалы. "
-        "График 2 сопоставляет эмпирическую F*(r) расстояний до ближайшего соседа с "
-        "независимым имитационным эталоном (другие seed) и аналитической кривой Рэлея для "
-        "случайного размещения (CSR). Расстояния — характеристики отдельных объектов внутри "
-        "реализации (зависимые): используются для формы распределения, а не для ДИ среднего."
+        "панель слева). Исследование: n независимых реализаций каждого из пяти законов "
+        "(четыре базовых и криволинейное); классические оценки M*(n), D̃(n), σ̃(n), "
+        "ε(β,n) и доверительные интервалы. График 2 сопоставляет эмпирическую F*(r) "
+        "расстояний до ближайшего соседа с независимым имитационным эталоном (другие seed) "
+        "и аналитической кривой Рэлея для CSR. Для криволинейного закона дополнительно "
+        "проверяются равномерность по длине кривой и поперечное отклонение; ниже — "
+        "сравнение извилистостей. Ограничения размещения учитываются: проверки характеризуют "
+        "фактические реализуемые конфигурации."
     )
 
     ts1, ts2, ts3, ts4 = st.columns(4)
@@ -752,7 +769,7 @@ with tab_model_stat:
     ts_seed = ts4.number_input("Начальный seed испытаний", value=0, step=1, key="ts_seed")
 
     ts5, ts6, ts7, ts8 = st.columns(4)
-    ts_model = ts5.selectbox("Закон для графиков 4–6", list(MODELS),
+    ts_model = ts5.selectbox("Закон для графиков 4–6", list(TARGET_MODELS),
                              format_func=lambda m: MODEL_TITLES_RU[m], key="ts_model")
     ts_metric = ts6.selectbox(
         "Пространственная характеристика",
@@ -767,14 +784,26 @@ with tab_model_stat:
     ts_clusters = ts7.number_input("Групп (кластерный закон)", value=5, min_value=1, step=1,
                                    key="ts_clusters")
     ts_sigma = ts8.number_input("СКО группы, м", value=1500.0, min_value=1.0, key="ts_sigma")
-    ts9, ts10, _, _ = st.columns(4)
+    ts9, ts10, ts11, ts12 = st.columns(4)
     ts_jitter = ts9.slider("Дрожание решётки (регулярный)", 0.0, 1.0, 0.6, key="ts_jitter")
     ts_lines = ts10.number_input("Линейных структур", value=4, min_value=1, step=1, key="ts_lines")
+    ts_curve_bend = ts11.number_input("Извилистость кривой, м", value=2500.0, min_value=0.0,
+                                      key="ts_curve_bend")
+    ts_curve_width = ts12.number_input("Ширина коридора кривой, м", value=1000.0,
+                                       min_value=0.0, key="ts_curve_width")
+    ts13, ts14, _, _ = st.columns(4)
+    ts_bend_values = ts13.text_input("Сравнение извилистостей, м (через запятую)",
+                                     "0, 1500, 3000", key="ts_bend_values")
+    ts_bend_n = ts14.number_input("n на извилистость", value=100, min_value=20,
+                                  max_value=1000, step=20, key="ts_bend_n")
 
     if st.button("Провести исследование", type="primary", key="ts_run"):
         local = LocalCRS(center_lat, center_lon)
         district = build_district_polygon(local, width * 1000.0, height * 1000.0, rotation)
         try:
+            bend_values = parse_float_list(ts_bend_values, "Сравнение извилистостей")
+            if any(v < 0.0 for v in bend_values):
+                raise ValueError("Сравнение извилистостей: значения должны быть неотрицательными.")
             ts_params = SpatialModelParams(
                 model=ts_model, count=int(count),
                 vertices_min=int(vertices_min), vertices_max=int(vertices_max),
@@ -782,9 +811,11 @@ with tab_model_stat:
                 irregularity=float(irregularity), max_aspect_ratio=float(max_aspect),
                 rotation_min_deg=float(rot_min), rotation_max_deg=float(rot_max),
                 boundary_margin_m=float(boundary_margin), min_distance_m=float(min_distance),
+                max_attempts_per_object=int(max_attempts),
                 n_clusters=int(ts_clusters), cluster_sigma_m=float(ts_sigma),
                 jitter_fraction=float(ts_jitter), n_lines=int(ts_lines),
                 line_sigma_m=400.0,
+                curve_bend_m=float(ts_curve_bend), curve_width_m=float(ts_curve_width),
             )
         except ValueError as exc:
             st.error(f"Ошибка параметров: {exc}")
@@ -793,26 +824,32 @@ with tab_model_stat:
         progress = st.progress(0.0, text="Статистические испытания…")
         study = run_target_model_study(
             ts_params, district, realizations=int(ts_n), seed_start=int(ts_seed),
-            beta=float(ts_beta), grid=5, models=MODELS,
-            progress=lambda d, t: progress.progress(d / (3 * t),
+            beta=float(ts_beta), grid=5, models=TARGET_MODELS,
+            progress=lambda d, t: progress.progress(0.45 * d / t,
                                                     text=f"Испытания: {d}/{t}"),
         )
         nn_emp = collect_nn_samples(
-            ts_params, district, models=MODELS, realizations=int(ts_n),
+            ts_params, district, models=TARGET_MODELS, realizations=int(ts_n),
             seed_start=int(ts_seed),
-            progress=lambda d, t: progress.progress(1 / 3 + d / (3 * t),
+            progress=lambda d, t: progress.progress(0.45 + 0.15 * d / t,
                                                     text=f"Выборки F*(r): {d}/{t}"),
         )
         nn_ref = collect_nn_samples(
-            ts_params, district, models=MODELS, realizations=int(ts_n),
+            ts_params, district, models=TARGET_MODELS, realizations=int(ts_n),
             seed_start=int(ts_seed) + 100_000,
-            progress=lambda d, t: progress.progress(2 / 3 + d / (3 * t),
+            progress=lambda d, t: progress.progress(0.60 + 0.15 * d / t,
                                                     text=f"Имитационный эталон: {d}/{t}"),
+        )
+        curve_study = run_curved_line_study(
+            ts_params, district, bend_values=bend_values, realizations=int(ts_bend_n),
+            seed_start=int(ts_seed) + 200_000, beta=0.95, bins=10, grid=5,
+            progress=lambda d, t: progress.progress(0.75 + 0.25 * d / t,
+                                                    text=f"Сравнение извилистостей: {d}/{t}"),
         )
         progress.empty()
 
         examples = {}
-        for m in MODELS:
+        for m in TARGET_MODELS:
             p = SpatialModelParams(**study["per_model"][m]["params"])
             examples[m] = generate_target_objects(
                 p, district, np.random.default_rng(np.random.SeedSequence([int(ts_seed), 20261126, len(m)])))
@@ -826,10 +863,11 @@ with tab_model_stat:
         )
         st.session_state["ts_study"] = study
         st.session_state["ts_charts"] = charts
+        st.session_state["ts_curve_study"] = curve_study
         st.session_state["ts_settings"] = {
             "n": int(ts_n), "beta": float(ts_beta), "eps0": float(ts_eps0),
             "seed": int(ts_seed), "model": ts_model, "metric": ts_metric,
-            "params": ts_params,
+            "params": ts_params, "bend_values": bend_values, "bend_n": int(ts_bend_n),
         }
 
     ts_study = st.session_state.get("ts_study")
@@ -844,10 +882,12 @@ with tab_model_stat:
             {"Параметр": "Количество объектов", "Значение": p_used.count},
             {"Параметр": "Площади объектов, м²", "Значение": f"{p_used.area_min_m2:,.0f} – {p_used.area_max_m2:,.0f}"},
             {"Параметр": "Вершин контура", "Значение": f"{p_used.vertices_min} – {p_used.vertices_max}"},
-            {"Параметр": "Законы распределения", "Значение": "равномерно-случайный, кластерный, регулярный, линейный"},
+            {"Параметр": "Законы распределения", "Значение": "равномерно-случайный, кластерный, регулярный, прямолинейный, криволинейный"},
             {"Параметр": "Параметры кластерного закона", "Значение": f"K = {p_used.n_clusters}, σ = {p_used.cluster_sigma_m:,.0f} м"},
             {"Параметр": "Параметр регулярного закона", "Значение": f"дрожание j = {p_used.jitter_fraction:.2f}"},
-            {"Параметр": "Параметры линейного закона", "Значение": f"L = {p_used.n_lines}, σ_l = {p_used.line_sigma_m:,.0f} м"},
+            {"Параметр": "Параметры прямолинейного закона", "Значение": f"L = {p_used.n_lines}, σ_l = {p_used.line_sigma_m:,.0f} м"},
+            {"Параметр": "Параметры криволинейного закона", "Значение": f"извилистость {p_used.curve_bend_m:,.0f} м; коридор {p_used.curve_width_m:,.0f} м"},
+            {"Параметр": "Сравнение извилистостей", "Значение": f"{', '.join(f'{v:g}' for v in ts_settings['bend_values'])} м; n = {ts_settings['bend_n']} на значение; β = 0,95"},
             {"Параметр": "Ограничения размещения", "Значение": f"отступ {p_used.boundary_margin_m:,.0f} м; мин. расстояние {p_used.min_distance_m:,.0f} м; пересечения запрещены"},
             {"Параметр": "Объём испытаний n", "Значение": ts_settings["n"]},
             {"Параметр": "Доверительная вероятность β", "Значение": ts_settings["beta"]},
@@ -860,7 +900,7 @@ with tab_model_stat:
                     f"(характеристика: {ts_study['metric_titles_ru'][metric_t]}, "
                     f"n = {ts_settings['n']}, β = {ts_settings['beta']:.2f})")
         rows = []
-        for m in MODELS:
+        for m in ts_study["models"]:
             pm = ts_study["per_model"][m]
             last = pm["classical"][metric_t][-1]
             skew = sample_skewness([r[metric_t] for r in pm["runs"]])
@@ -885,12 +925,68 @@ with tab_model_stat:
             "не применяются."
         )
 
+        ts_curve_study = st.session_state.get("ts_curve_study")
+        if ts_curve_study is not None:
+            nominal_item = next(
+                (item for item in ts_curve_study["per_bend"]
+                 if abs(item["bend_m"] - float(p_used.curve_bend_m)) < 1e-9),
+                ts_curve_study["per_bend"][0],
+            )
+            u = nominal_item["uniformity"]
+            st.markdown(
+                f"**Таблица 3. Проверка равномерности вдоль кривой и поперечного распределения** "
+                f"(извилистость {nominal_item['bend_m']:g} м, n = {ts_curve_study['realizations']}, "
+                f"β = {ts_curve_study['beta']:.2f})"
+            )
+            st.dataframe(pd.DataFrame([{
+                "Средняя длина кривой, м": round(u["curve_length_mean_m"], 1),
+                "KS вдоль: среднее D": round(u["along_ks_mean"], 4),
+                "KS вдоль: max D": round(u["along_ks_max"], 4),
+                "Доля отклон. вдоль (χ²)": round(u["along_chi2_reject_share"], 3),
+                "Поперёк: среднее, м": round(u["lateral_mean_m"], 2),
+                "Поперёк: σ, м": round(u["lateral_std_m"], 2),
+                "Поперёк: теор. σ, м": round(u["lateral_std_theory_m"], 2),
+                "Поперёк: среднее |x|, м": round(u["lateral_abs_mean_m"], 2),
+                "Поперёк: теор. |x|, м": round(u["lateral_abs_mean_theory_m"], 2),
+                "KS поперёк: среднее D": round(u["lateral_ks_mean"], 4),
+                "Доля отклон. поперёк (χ²)": round(u["lateral_chi2_reject_share"], 3),
+            }]))
+            st.caption(
+                "H₀ вдоль: s/L ~ U[0,1]; H₀ поперёк: x ~ U[−w/2, w/2]. KS D сравнивается с "
+                "приближённым 5 %-м уровнем 1,358/√N; χ² — по 10 равным интервалам. "
+                "Отклонения допустимы: ограничения размещения условно усекают коридор и "
+                "изменяют исходное распределение кандидатов."
+            )
+
+            st.markdown("**Таблица 4. Влияние извилистости на расстояния и пространственные индексы** "
+                        "(M* ± ε, β = 0,95)")
+            bend_rows = []
+            for item in ts_curve_study["per_bend"]:
+                def _last(metric):
+                    return item["classical"][metric][-1]
+                bend_rows.append({
+                    "Извилистость, м": item["bend_m"],
+                    "d̄ до NND, м": f"{_last('nn_mean_m')['m_star']:.1f} ± {_last('nn_mean_m')['epsilon']:.1f}",
+                    "Индекс R": f"{_last('ce_r')['m_star']:.3f} ± {_last('ce_r')['epsilon']:.3f}",
+                    "Индекс I": f"{_last('dispersion_index')['m_star']:.3f} ± {_last('dispersion_index')['epsilon']:.3f}",
+                    "Направленность R_b": f"{_last('nn_bearing_r')['m_star']:.3f} ± {_last('nn_bearing_r')['epsilon']:.3f}",
+                    "KS вдоль, среднее D": f"{_last('along_ks')['m_star']:.4f} ± {_last('along_ks')['epsilon']:.4f}",
+                    "Среднее |поперечное|, м": f"{_last('lateral_abs_mean_m')['m_star']:.1f} ± {_last('lateral_abs_mean_m')['epsilon']:.1f}",
+                })
+            st.dataframe(pd.DataFrame(bend_rows))
+            st.caption(
+                "Одинаковый набор seed для всех извилистостей делает сравнение спаренным. "
+                "Рост извилистости удлиняет ось кривой и может снижать концентрацию объектов; "
+                "запрет пересечений и минимальные расстояния дополнительно регуляризуют "
+                "точки, поэтому индексы отражают реализуемые конфигурации."
+            )
+
         st.markdown("**Шесть обязательных научных графиков**")
         for name in sorted(ts_charts):
             png = next(p for p in ts_charts[name] if p.suffix == ".png")
             st.image(str(png))
 
-        st.subheader("Экспорт графиков")
+        st.subheader("Экспорт графиков и проверок кривой")
         import zipfile
 
         buf_png = io.BytesIO()
@@ -898,8 +994,30 @@ with tab_model_stat:
             for name, ps in ts_charts.items():
                 for p in ps:
                     zf.write(p, arcname=p.name)
-        st.download_button("Скачать все графики (PNG + SVG, zip)", buf_png.getvalue(),
-                           file_name="target_statistics_charts.zip", mime="application/zip")
+        exp1, exp2, exp3 = st.columns(3)
+        exp1.download_button("Скачать все графики (PNG + SVG, zip)", buf_png.getvalue(),
+                             file_name="target_statistics_charts.zip", mime="application/zip")
+        ts_curve_study = st.session_state.get("ts_curve_study")
+        if ts_curve_study is not None:
+            curve_dir = Path(tempfile.mkdtemp(prefix="sro_curve_stat_"))
+            curve_csv = write_curved_line_csv(ts_curve_study, curve_dir)
+            curve_json = write_curved_line_json(ts_curve_study, curve_dir)
+            exp2.download_button(
+                "Скачать проверки кривой (JSON)",
+                curve_json.read_bytes(),
+                file_name="curved_line_statistics.json",
+                mime="application/json",
+            )
+            buf_curve = io.BytesIO()
+            with zipfile.ZipFile(buf_curve, "w", zipfile.ZIP_DEFLATED) as zf:
+                for p in curve_csv.values():
+                    zf.write(p, arcname=p.name)
+            exp3.download_button(
+                "Скачать таблицы кривой (CSV, zip)",
+                buf_curve.getvalue(),
+                file_name="curved_line_statistics.zip",
+                mime="application/zip",
+            )
 
 # ---------------------------------------------------------------------------
 # Вкладка 5. Совместная модель района ДЗЗ

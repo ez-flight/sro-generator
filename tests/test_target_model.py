@@ -254,11 +254,11 @@ class TestCurvedPlacement:
         with pytest.raises(ValueError, match="LineString"):
             load_curve_geojson({"type": "Polygon", "coordinates": []}, local)
 
-    def test_curved_not_added_to_base_statistical_models(self):
-        # Статистические вкладки сохраняют четыре базовых закона; curved — расширение
-        # только вкладки «Модель объектов съёмки».
+    def test_curved_added_to_statistical_models(self):
+        # Криволинейный закон входит в исследование наряду с четырьмя базовыми.
         assert "curved" not in MODELS
         assert "curved" in TARGET_MODELS
+        assert "curved" in SpatialModelParams(model="curved").model
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +356,7 @@ class TestModelSignatures:
         assert lin_b > uni_b                  # выраженная анизотропия направлений
 
     def test_classical_series_consistency(self, study):
-        for model in MODELS:
+        for model in TARGET_MODELS:
             series = study["per_model"][model]["classical"]["nn_mean_m"]
             assert len(series) == 40 - 1      # n = 2…N
             last = series[-1]
@@ -380,7 +380,7 @@ class TestExport:
         paths = write_target_csv(study, tmp_path)
         assert set(paths) == {"target_runs.csv", "target_summary.csv"}
         runs = (tmp_path / "target_runs.csv").read_text(encoding="utf-8").splitlines()
-        assert len(runs) == 1 + 4 * 10
+        assert len(runs) == 1 + 5 * 10
 
     def test_json(self, study, tmp_path):
         path = write_target_json(study, tmp_path)
@@ -388,11 +388,11 @@ class TestExport:
 
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["mode"] == "target_object_distribution"
-        assert set(data["per_model"]) == set(MODELS)
+        assert set(data["per_model"]) == set(TARGET_MODELS)
 
     def test_charts(self, study, tmp_path):
         examples = {}
-        for model in MODELS:
+        for model in TARGET_MODELS:
             p = SpatialModelParams(**study["per_model"][model]["params"])
             examples[model] = generate_target_objects(p, DISTRICT, np.random.default_rng(0))
         paths = render_target_charts(study, examples, tmp_path)

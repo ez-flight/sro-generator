@@ -119,6 +119,7 @@ def main() -> None:
     t0 = time.time()
     study = run_target_model_study(
         params, district, realizations=n, seed_start=0, beta=BETA, grid=5,
+        models=MODELS,  # исторический стенд 2.2.0: четыре базовых закона
         progress=lambda d, t: print(f"\r  испытаний: {d}/{t}", end="", flush=True),
     )
     print(f"\nОсновное исследование: {time.time() - t0:.1f} с")
