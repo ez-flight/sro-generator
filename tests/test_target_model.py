@@ -6,14 +6,17 @@ import math
 
 import numpy as np
 import pytest
-from shapely.geometry import box
+from shapely.geometry import LineString, box
 
+from sro_generator.geometry import LocalCRS
 from sro_generator.placement import PlacementError
 from sro_generator.target_model import (
     MODELS,
+    TARGET_MODELS,
     SpatialModelParams,
     chi2_quantile,
     generate_target_objects,
+    load_curve_geojson,
     nearest_neighbor_stats,
     quadrant_stats,
     realization_metrics,
@@ -69,6 +72,16 @@ class TestParamsValidation:
     def test_bad_lines(self):
         with pytest.raises(ValueError, match="n_lines"):
             SpatialModelParams(n_lines=0)
+
+    def test_bad_curve_params(self):
+        with pytest.raises(ValueError, match="curve_bend"):
+            SpatialModelParams(model="curved", curve_bend_m=-1.0)
+        with pytest.raises(ValueError, match="curve_width"):
+            SpatialModelParams(model="curved", curve_width_m=-1.0)
+        with pytest.raises(ValueError, match="curve_control_points"):
+            SpatialModelParams(model="curved", curve_control_points=3)
+        with pytest.raises(ValueError, match="curve_smoothing"):
+            SpatialModelParams(model="curved", curve_smoothing_iterations=9)
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +156,109 @@ class TestPlacement:
         p = small_params("regular", count=20)
         r = generate_target_objects(p, DISTRICT, np.random.default_rng(0))
         assert len(r.objects) == 20
+
+
+# ---------------------------------------------------------------------------
+# Криволинейное расширение линейного закона
+# ---------------------------------------------------------------------------
+
+class TestCurvedPlacement:
+    def curved_params(self, count: int = 25, width: float = 600.0,
+                      bend: float = 1_800.0) -> SpatialModelParams:
+        return SpatialModelParams(
+            model="curved", count=count,
+            area_min_m2=50_000.0, area_max_m2=300_000.0,
+            boundary_margin_m=200.0, min_distance_m=100.0,
+            curve_bend_m=bend, curve_width_m=width,
+            curve_control_points=9, curve_smoothing_iterations=4,
+        )
+
+    def test_count_bounds_and_no_overlap(self):
+        p = self.curved_params()
+        r = generate_target_objects(p, DISTRICT, np.random.default_rng(0))
+        assert len(r.objects) == p.count
+        inner = DISTRICT.buffer(-p.boundary_margin_m)
+        for i, a in enumerate(r.objects):
+            assert inner.covers(a.geometry)
+            for b in r.objects[i + 1:]:
+                assert a.geometry.intersection(b.geometry).area <= 1e-9
+                assert a.geometry.distance(b.geometry) >= p.min_distance_m - 1e-9
+
+    def test_smooth_curve_is_stored(self):
+        p = self.curved_params(count=20)
+        r = generate_target_objects(p, DISTRICT, np.random.default_rng(0))
+        assert len(r.line_chords) == 1
+        curve = r.line_chords[0]
+        assert curve.length > 20_000.0
+        # 9 контрольных точек + 4 прохода Чайкина дают существенно более плавную линию.
+        assert len(curve.coords) > 100
+        assert all(o.group_id == 0 for o in r.objects)
+
+    def test_zero_width_centers_on_curve(self):
+        p = self.curved_params(count=18, width=0.0, bend=1_500.0)
+        r = generate_target_objects(p, DISTRICT, np.random.default_rng(1))
+        curve = r.line_chords[0]
+        assert all(o.center.distance(curve) <= 1e-6 for o in r.objects)
+
+    def test_corridor_width(self):
+        width = 800.0
+        p = self.curved_params(count=25, width=width, bend=2_000.0)
+        r = generate_target_objects(p, DISTRICT, np.random.default_rng(2))
+        curve = r.line_chords[0]
+        assert all(o.center.distance(curve) <= 0.5 * width + 1e-6 for o in r.objects)
+
+    def test_reproducibility(self):
+        p = self.curved_params(count=15)
+        r1 = generate_target_objects(p, DISTRICT, np.random.default_rng(42))
+        r2 = generate_target_objects(p, DISTRICT, np.random.default_rng(42))
+        assert list(r1.line_chords[0].coords) == list(r2.line_chords[0].coords)
+        assert [(o.center.x, o.center.y) for o in r1.objects] == \
+               [(o.center.x, o.center.y) for o in r2.objects]
+
+    def test_imported_curve_geojson(self):
+        local = LocalCRS(55.0, 60.0)
+        xy = [(-11_000.0, -6_000.0), (-3_000.0, 1_000.0),
+              (4_000.0, -1_000.0), (11_000.0, 5_000.0)]
+        lonlat = [local.to_lonlat(x, y) for x, y in xy]
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {"name": "river"},
+                "geometry": {"type": "LineString", "coordinates": lonlat},
+            }],
+        }
+        curve = load_curve_geojson(geojson, local)
+        assert isinstance(curve, LineString)
+        assert curve.length == pytest.approx(LineString(xy).length, rel=1e-6)
+
+        p = self.curved_params(count=20, width=700.0)
+        r = generate_target_objects(p, DISTRICT, np.random.default_rng(3), curve=curve)
+        assert len(r.objects) == p.count
+        assert r.line_chords[0].length == pytest.approx(curve.length, rel=1e-9)
+        assert all(o.center.distance(curve) <= 0.5 * p.curve_width_m + 1e-6
+                   for o in r.objects)
+
+    def test_multiline_import_chooses_longest(self):
+        local = LocalCRS(55.0, 60.0)
+        short = [local.to_lonlat(0.0, 0.0), local.to_lonlat(100.0, 0.0)]
+        long = [local.to_lonlat(-10_000.0, 0.0), local.to_lonlat(10_000.0, 0.0)]
+        curve = load_curve_geojson({
+            "type": "MultiLineString",
+            "coordinates": [short, long],
+        }, local)
+        assert curve.length == pytest.approx(20_000.0, rel=1e-6)
+
+    def test_bad_geojson_geometry(self):
+        local = LocalCRS(55.0, 60.0)
+        with pytest.raises(ValueError, match="LineString"):
+            load_curve_geojson({"type": "Polygon", "coordinates": []}, local)
+
+    def test_curved_not_added_to_base_statistical_models(self):
+        # Статистические вкладки сохраняют четыре базовых закона; curved — расширение
+        # только вкладки «Модель объектов съёмки».
+        assert "curved" not in MODELS
+        assert "curved" in TARGET_MODELS
 
 
 # ---------------------------------------------------------------------------

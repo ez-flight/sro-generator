@@ -1,13 +1,13 @@
-"""Модель объектов съёмки: четыре закона пространственного размещения.
+"""Модель объектов съёмки: законы пространственного размещения.
 
 Модуль реализует математические модели пространственного распределения целевых
 объектов ДЗЗ внутри района (в локальной метрической СК, см. ``geometry.LocalCRS``)
 и инструментарий их статистической проверки.
 
-Законы размещения (генерируются центры, форма строится общим геометрическим
-ядром ``geometry.generate_polygon_shape``; соблюдаются границы района с отступом,
-запрет пересечений по площади и минимальное расстояние между полигонами —
-семантика :func:`placement.pair_placement_ok`):
+Базовые законы размещения (генерируются центры, форма строится общим
+геометрическим ядром ``geometry.generate_polygon_shape``; соблюдаются границы
+района с отступом, запрет пересечений по площади и минимальное расстояние между
+полигонами — семантика :func:`placement.pair_placement_ok`):
 
 1. ``uniform`` — равномерно-случайное: центры — независимые равномерно
    распределённые точки в допустимой области (однородный пуассоновский процесс
@@ -23,6 +23,12 @@
 4. ``linear`` — линейное: L прямолинейных структур (хорды района со случайной
    точкой и азимутом); центр объекта — равномерная точка вдоль хорды случайно
    выбранной структуры плюс нормальное поперечное отклонение ``line_sigma_m``.
+5. ``curved`` — криволинейное расширение линейного закона: одна плавная кривая
+   (случайная или импортированная из GeoJSON); позиция объекта выбирается
+   равномерно по длине кривой, поперечное смещение — равномерно в коридоре
+   шириной ``curve_width_m``. Случайная кривая строится от хорды района:
+   контрольным точкам задаются сглаженные случайные боковые отклонения до
+   ``curve_bend_m``, после чего ломаная сглаживается алгоритмом Чайкина.
 
 Статистическая проверка (классическая школа статистических испытаний):
 для каждой независимой реализации вычисляются пространственные характеристики
@@ -55,6 +61,8 @@ from .placement import PlacementError, _sample_point_in_polygon, pair_placement_
 
 __all__ = [
     "MODELS",
+    "TARGET_MODELS",
+    "load_curve_geojson",
     "SpatialModelParams",
     "TargetObject",
     "TargetModelResult",
@@ -75,13 +83,18 @@ __all__ = [
     "render_statistics_charts",
 ]
 
+# MODELS — четыре базовых закона статистических вкладок; curved добавлен как
+# расширение линейного закона только в вкладку «Модель объектов съёмки».
 MODELS = ("uniform", "cluster", "regular", "linear")
+CURVED_MODEL = "curved"
+TARGET_MODELS = MODELS + (CURVED_MODEL,)
 
 MODEL_TITLES_RU = {
     "uniform": "Равномерно-случайное",
     "cluster": "Групповое (кластерное)",
     "regular": "Регулярное",
     "linear": "Линейное",
+    "curved": "Криволинейное",
 }
 
 
@@ -102,13 +115,17 @@ class SpatialModelParams:
       (False по умолчанию; True используется для полей препятствий-облаков,
       которые физически могут сливаться; см. ``joint_model``).
 
-    Закон размещения — ``model`` ∈ {uniform, cluster, regular, linear}:
+    Закон размещения — ``model`` ∈ {uniform, cluster, regular, linear, curved}:
     - ``cluster``: ``n_clusters`` — число групп, ``cluster_sigma_m`` — СКО
       гауссова отклонения центра объекта от центра группы;
     - ``regular``: ``jitter_fraction`` — доля полушага решётки для равномерного
       дрожания узлов (0 — строгая решётка, 1 — дрожание на полный полушаг);
-    - ``linear``: ``n_lines`` — число линейных структур, ``line_sigma_m`` — СКО
-      поперечного отклонения от структуры.
+    - ``linear``: ``n_lines`` — число прямых структур, ``line_sigma_m`` — СКО
+      поперечного отклонения от структуры;
+    - ``curved``: ``curve_bend_m`` — амплитуда случайного бокового изгиба,
+      ``curve_width_m`` — ширина поперечного коридора вокруг кривой,
+      ``curve_control_points`` — число контрольных точек случайной кривой,
+      ``curve_smoothing_iterations`` — число проходов сглаживания Чайкина.
     """
 
     model: str = "uniform"
@@ -130,10 +147,14 @@ class SpatialModelParams:
     jitter_fraction: float = 0.6
     n_lines: int = 4
     line_sigma_m: float = 300.0
+    curve_bend_m: float = 2_000.0
+    curve_width_m: float = 1_000.0
+    curve_control_points: int = 9
+    curve_smoothing_iterations: int = 4
 
     def __post_init__(self) -> None:
-        if self.model not in MODELS:
-            raise ValueError(f"target_model.model: допустимые значения {MODELS}.")
+        if self.model not in TARGET_MODELS:
+            raise ValueError(f"target_model.model: допустимые значения {TARGET_MODELS}.")
         if self.count < 1:
             raise ValueError("target_model.count: число объектов должно быть не меньше 1.")
         if not (3 <= self.vertices_min <= self.vertices_max <= 10):
@@ -160,6 +181,14 @@ class SpatialModelParams:
             raise ValueError("target_model.n_lines: число линейных структур не меньше 1.")
         if self.line_sigma_m < 0.0:
             raise ValueError("target_model.line_sigma_m: СКО отклонения не может быть отрицательным.")
+        if self.curve_bend_m < 0.0:
+            raise ValueError("target_model.curve_bend_m: извилистость не может быть отрицательной.")
+        if self.curve_width_m < 0.0:
+            raise ValueError("target_model.curve_width_m: ширина коридора не может быть отрицательной.")
+        if self.curve_control_points < 4:
+            raise ValueError("target_model.curve_control_points: нужно не менее 4 контрольных точек.")
+        if not (0 <= self.curve_smoothing_iterations <= 8):
+            raise ValueError("target_model.curve_smoothing_iterations: допустимо 0…8.")
 
 
 @dataclass
@@ -254,10 +283,168 @@ def _regular_lattice_nodes(rng, inner, p, n):
             yield pt, None
 
 
+def _longest_line_part(geom) -> LineString | None:
+    """Наибольшая непустая LineString-часть геометрии (после пересечения с районом)."""
+    if geom.is_empty:
+        return None
+    if geom.geom_type == "LineString":
+        return geom if geom.length > 0.0 else None
+    best: LineString | None = None
+    for part in getattr(geom, "geoms", []):
+        line = _longest_line_part(part)
+        if line is not None and (best is None or line.length > best.length):
+            best = line
+    return best
+
+
+def _smooth_offsets(values: np.ndarray, passes: int = 2) -> np.ndarray:
+    """Скользящее сглаживание внутренних боковых отклонений (края не трогаем)."""
+    out = np.asarray(values, dtype=float).copy()
+    for _ in range(passes):
+        if len(out) <= 2:
+            break
+        out[1:-1] = 0.25 * out[:-2] + 0.5 * out[1:-1] + 0.25 * out[2:]
+    return out
+
+
+def _chaikin_smooth(points: list[tuple[float, float]], iterations: int) -> list[tuple[float, float]]:
+    """Сглаживание открытой ломаной алгоритмом Чайкина (без изменения концов)."""
+    pts = [(float(x), float(y)) for x, y in points]
+    for _ in range(int(iterations)):
+        if len(pts) < 2:
+            break
+        nxt = [pts[0]]
+        for a, b in zip(pts[:-1], pts[1:]):
+            nxt.append((0.75 * a[0] + 0.25 * b[0], 0.75 * a[1] + 0.25 * b[1]))
+            nxt.append((0.25 * a[0] + 0.75 * b[0], 0.25 * a[1] + 0.75 * b[1]))
+        nxt.append(pts[-1])
+        pts = nxt
+    return pts
+
+
+def _random_smooth_curve(rng: np.random.Generator, inner: Polygon, p: SpatialModelParams) -> LineString:
+    """Случайная плавная кривая внутри допустимой области.
+
+    Базовая хорда района задаёт общее направление; её равномерно разнесённые
+    контрольные точки получают случайные боковые отклонения до
+    ``curve_bend_m``, сглаживаются, после чего ломаная проходит несколько
+    проходов алгоритма Чайкина. Концы остаются на хорде, поэтому кривая
+    устойчиво пересекает район.
+    """
+    minx, miny, maxx, maxy = inner.bounds
+    diag = math.hypot(maxx - minx, maxy - miny)
+    # Две независимые внутренние точки дают скорее поперечное направление через
+    # район, чем старая схема «случайный центр + азимут», которая может дать
+    # касательную хорду вдоль границы.
+    chord: LineString | None = None
+    min_len = 0.5 * math.sqrt(inner.area)
+    for _ in range(100):
+        a = _sample_point_in_polygon(rng, inner)
+        b = _sample_point_in_polygon(rng, inner)
+        length = a.distance(b)
+        if length < min_len:
+            continue
+        ux, uy = (b.x - a.x) / length, (b.y - a.y) / length
+        line = LineString([(a.x - diag * ux, a.y - diag * uy),
+                           (b.x + diag * ux, b.y + diag * uy)])
+        chord = _longest_line_part(line.intersection(inner))
+        if chord is not None and chord.length >= min_len:
+            break
+        chord = None
+    if chord is None or chord.length <= 0.0:
+        raise PlacementError("target_model.curved: не удалось построить хорду района.")
+
+    n = max(4, int(p.curve_control_points))
+    spine = [chord.interpolate(i / (n - 1), normalized=True) for i in range(n)]
+    coords = np.array([(pt.x, pt.y) for pt in spine], dtype=float)
+    tangent = coords[-1] - coords[0]
+    norm = float(np.hypot(tangent[0], tangent[1]))
+    if norm <= 0.0:
+        raise PlacementError("target_model.curved: вырожденная хорда района.")
+    normal = np.array([-tangent[1] / norm, tangent[0] / norm], dtype=float)
+
+    offsets = np.zeros(n, dtype=float)
+    if n > 2:
+        offsets[1:-1] = rng.uniform(-p.curve_bend_m, p.curve_bend_m, size=n - 2)
+        offsets = _smooth_offsets(offsets)
+    controls = coords + normal * offsets[:, None]
+    curve = LineString(_chaikin_smooth(controls, p.curve_smoothing_iterations))
+    clipped = _longest_line_part(curve.intersection(inner))
+    if clipped is None or clipped.length <= 0.0:
+        raise PlacementError("target_model.curved: кривая не пересекает допустимую область района.")
+    return clipped
+
+
+def _curved_candidates(curve: LineString, p: SpatialModelParams, rng: np.random.Generator):
+    """Бесконечный поток точек: равномерно по длине кривой, поперёк коридора."""
+    def gen():
+        delta = max(1e-3, curve.length * 1e-3)
+        while True:
+            s = float(rng.uniform(0.0, curve.length))
+            pt = curve.interpolate(s)
+            a = curve.interpolate(max(0.0, s - delta))
+            b = curve.interpolate(min(curve.length, s + delta))
+            tx, ty = b.x - a.x, b.y - a.y
+            norm = math.hypot(tx, ty)
+            if norm <= 0.0:
+                continue
+            off = float(rng.uniform(-0.5 * p.curve_width_m, 0.5 * p.curve_width_m))
+            yield Point(pt.x - ty / norm * off, pt.y + tx / norm * off), 0
+
+    return gen()
+
+
+def load_curve_geojson(geojson: dict, local) -> LineString:
+    """Загрузить линию из GeoJSON (WGS 84) в локальную метрическую СК.
+
+    Принимает FeatureCollection, Feature или геометрию GeoJSON. Поддерживаются
+    ``LineString`` и ``MultiLineString``; из мультилинии выбирается самая
+    длинная часть. Координаты GeoJSON должны быть в порядке (lon, lat);
+    высота, если присутствует, игнорируется.
+    """
+    import json
+
+    if not isinstance(geojson, dict):
+        geojson = json.loads(geojson)
+    kind = geojson.get("type")
+    if kind == "FeatureCollection":
+        features = geojson.get("features") or []
+        if not features:
+            raise ValueError("curve GeoJSON: пустая FeatureCollection.")
+        geometry = features[0].get("geometry") or {}
+    elif kind == "Feature":
+        geometry = geojson.get("geometry") or {}
+    else:
+        geometry = geojson
+
+    gtype = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+    if gtype == "LineString":
+        lines = [coordinates]
+    elif gtype == "MultiLineString":
+        lines = list(coordinates or [])
+    else:
+        raise ValueError("curve GeoJSON: ожидается LineString или MultiLineString.")
+
+    best: LineString | None = None
+    for line_coords in lines:
+        if not line_coords or len(line_coords) < 2:
+            continue
+        points = [local.to_xy(float(c[0]), float(c[1])) for c in line_coords]
+        line = LineString(points)
+        if line.length > 0.0 and (best is None or line.length > best.length):
+            best = line
+    if best is None:
+        raise ValueError("curve GeoJSON: не найдено корректной линии с двумя точками.")
+    return best
+
+
 def generate_target_objects(
     params: SpatialModelParams,
     district: Polygon,
     rng: np.random.Generator,
+    *,
+    curve: LineString | None = None,
 ) -> TargetModelResult:
     """Разместить ``params.count`` объектов в районе по выбранному закону.
 
@@ -266,8 +453,10 @@ def generate_target_objects(
     площади, расстояние между полигонами не меньше ``min_distance_m``.
     При невозможности разместить объект за ``max_attempts_per_object`` попыток —
     PlacementError. Одинаковые params, district и seed rng дают одинаковый
-    результат. Структура модели (центры групп для cluster, хорды для linear)
-    сохраняется в результате.
+    результат. Для ``model="curved"`` можно передать ``curve`` — линию в
+    локальных метрах (например, загруженную :func:`load_curve_geojson`);
+    иначе кривая генерируется случайно. Структура модели (центры групп для
+    cluster, линейные структуры для linear/curved) сохраняется в результате.
     """
     p = params
     inner = district.buffer(-p.boundary_margin_m)
@@ -294,7 +483,7 @@ def generate_target_objects(
         candidates = cluster_gen()
     elif p.model == "regular":
         candidates = _regular_lattice_nodes(rng, inner, p, p.count)
-    else:  # linear
+    elif p.model == "linear":
         minx, miny, maxx, maxy = inner.bounds
         diag = math.hypot(maxx - minx, maxy - miny)
         chords: list[LineString] = []
@@ -304,12 +493,8 @@ def generate_target_objects(
             dx, dy = math.cos(az), math.sin(az)
             line = LineString([(base.x - diag * dx, base.y - diag * dy),
                                (base.x + diag * dx, base.y + diag * dy)])
-            chord = line.intersection(inner)
-            if chord.is_empty or chord.length <= 0.0:
-                continue
-            if chord.geom_type == "MultiLineString":
-                chord = max(chord.geoms, key=lambda g: g.length)
-            if chord.geom_type == "LineString" and chord.length > 0.0:
+            chord = _longest_line_part(line.intersection(inner))
+            if chord is not None and chord.length > 0.0:
                 chords.append(chord)
         if not chords:
             raise PlacementError("target_model.linear: не удалось построить ни одной хорды района.")
@@ -326,6 +511,20 @@ def generate_target_objects(
                 yield Point(pt0.x - math.sin(az) * off, pt0.y + math.cos(az) * off), li
 
         candidates = linear_gen()
+    elif p.model == "curved":
+        if curve is not None:
+            if not isinstance(curve, LineString) or curve.is_empty or curve.length <= 0.0:
+                raise ValueError("target_model.curved: curve должна быть непустой LineString.")
+            source = curve
+        else:
+            source = _random_smooth_curve(rng, inner, p)
+        curved = _longest_line_part(source.intersection(inner))
+        if curved is None or curved.length <= 0.0:
+            raise PlacementError("target_model.curved: кривая не пересекает допустимую область района.")
+        result.line_chords = [curved]
+        candidates = _curved_candidates(curved, p, rng)
+    else:
+        raise ValueError(f"target_model.model: допустимые значения {TARGET_MODELS}.")
 
     for k in range(p.count):
         object_id = f"TGT-{k + 1:03d}"

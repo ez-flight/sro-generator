@@ -1,4 +1,4 @@
-"""Графический интерфейс SRO Generator 2.3.1 (Streamlit).
+"""Графический интерфейс SRO Generator 2.4.0 (Streamlit).
 
 Пять вкладок:
 1. «Генерация СРО» — настройка района и объектов, воспроизводимая генерация
@@ -30,7 +30,9 @@ monte_carlo_convergence.py, cloud_coverage_analysis.py); вычислитель�
 
 from __future__ import annotations
 
+import hashlib
 import io
+import json
 import os
 import tempfile
 
@@ -59,18 +61,20 @@ from sro_generator.joint_model import (
 from sro_generator.target_model import (
     MODEL_TITLES_RU,
     MODELS,
+    TARGET_MODELS,
     SpatialModelParams,
     collect_nn_samples,
     export_target_geojson,
     generate_target_objects,
+    load_curve_geojson,
     realization_metrics,
     render_statistics_charts,
     run_target_model_study,
     sample_skewness,
 )
 
-st.set_page_config(page_title="SRO Generator 2.3.1", layout="wide")
-st.title("SRO Generator 2.3.1 — генерация СРО, пространственные модели и досъёмка РСА")
+st.set_page_config(page_title="SRO Generator 2.4", layout="wide")
+st.title("SRO Generator 2.4 — генерация СРО, пространственные модели и досъёмка РСА")
 
 with st.sidebar:
     st.header("Район")
@@ -502,10 +506,12 @@ def render_target_preview(result, path):
     fig, ax = plt.subplots(figsize=(10, 10))
     dx, dy = result.district.exterior.xy
     ax.plot(dx, dy, "k-", linewidth=1.5, label="Район")
+    structure_label = ("криволинейная структура" if result.params.model == "curved"
+                       else "линейная структура")
     for chord in result.line_chords:
         cx, cy = chord.xy
         ax.plot(cx, cy, color="0.4", linestyle="--", linewidth=1.2,
-                label="линейная структура" if chord is result.line_chords[0] else None)
+                label=structure_label if chord is result.line_chords[0] else None)
     for i, c in enumerate(result.cluster_centers):
         ax.plot(c.x, c.y, marker="x", color="red", markersize=10, markeredgewidth=2.2,
                 label="центр группы" if i == 0 else None)
@@ -538,16 +544,17 @@ with tab_model:
     st.subheader("Модель объектов съёмки: законы пространственного размещения")
     st.caption(
         "Математическая модель пространственного распределения целевых объектов ДЗЗ "
-        "в районе (панель «Район» и «Объекты» слева). Четыре закона: равномерно-случайное, "
-        "групповое (кластерное), регулярное (решётка с дрожанием) и линейное (вдоль "
-        "пространственных структур). Объекты имеют геометрию, размеры, площадь и "
-        "координаты; соблюдаются границы района с отступом и минимальное расстояние; "
-        "реализация воспроизводима по seed."
+        "в районе (панель «Район» и «Объекты» слева). Четыре базовых закона: "
+        "равномерно-случайное, групповое (кластерное), регулярное (решётка с дрожанием) "
+        "и линейное (вдоль прямых структур), а также криволинейное расширение линейного "
+        "закона — вдоль случайной или импортированной из GeoJSON плавной кривой. Объекты "
+        "имеют геометрию, размеры, площадь и координаты; соблюдаются границы района с "
+        "отступом и минимальное расстояние; реализация воспроизводима по seed."
     )
 
-    law_labels = {m: MODEL_TITLES_RU[m] for m in MODELS}
+    law_labels = {m: MODEL_TITLES_RU[m] for m in TARGET_MODELS}
     tm_model = st.selectbox(
-        "Закон пространственного распределения", list(MODELS),
+        "Закон пространственного распределения", list(TARGET_MODELS),
         format_func=lambda m: law_labels[m], key="tm_model")
     tc1, tc2, tc3 = st.columns(3)
     tm_n_clusters = tc1.number_input("Число групп (кластерное)", value=5, min_value=1, step=1,
@@ -556,15 +563,59 @@ with tab_model:
                                         disabled=tm_model != "cluster")
     tm_jitter = tc3.slider("Дрожание решётки (регулярное)", 0.0, 1.0, 0.6,
                            disabled=tm_model != "regular")
-    tc4, tc5, _ = st.columns(3)
-    tm_n_lines = tc4.number_input("Число линейных структур", value=4, min_value=1, step=1,
+    tc4, tc5, tc6 = st.columns(3)
+    tm_n_lines = tc4.number_input("Число прямых структур", value=4, min_value=1, step=1,
                                   disabled=tm_model != "linear")
     tm_line_sigma = tc5.number_input("СКО поперечного отклонения, м (линейное)", value=400.0,
                                      min_value=0.0, disabled=tm_model != "linear")
+    tm_curve_bend = tc6.number_input("Извилистость кривой, м", value=2500.0, min_value=0.0,
+                                     disabled=tm_model != "curved")
+    tc7, tc8, _ = st.columns(3)
+    tm_curve_width = tc7.number_input("Ширина коридора, м (криволинейное)", value=1000.0,
+                                      min_value=0.0, disabled=tm_model != "curved")
+    tm_curve_file = st.file_uploader(
+        "Импорт кривой из GeoJSON (LineString/MultiLineString, WGS 84)",
+        type=["geojson", "json"], disabled=tm_model != "curved", key="tm_curve_file")
+    if tm_model == "curved":
+        st.caption("Если файл не загружен, кривая строится случайно от хорды района. "
+                   "Объекты выбираются равномерно по длине кривой в пределах коридора.")
+
+    tm_curve_bytes = tm_curve_file.getvalue() if tm_curve_file is not None else None
+    tm_curve_hash = (hashlib.sha256(tm_curve_bytes).hexdigest()
+                     if tm_curve_bytes is not None else None)
+    tm_controls = (
+        float(center_lat), float(center_lon), float(width), float(height), float(rotation),
+        int(count), int(vertices_min), int(vertices_max), float(area_min), float(area_max),
+        float(irregularity), float(rot_min), float(rot_max), float(max_aspect),
+        float(min_distance), float(boundary_margin), int(max_attempts), int(seed),
+        str(tm_model), int(tm_n_clusters), float(tm_cluster_sigma), float(tm_jitter),
+        int(tm_n_lines), float(tm_line_sigma), float(tm_curve_bend), float(tm_curve_width),
+        tm_curve_hash,
+    )
+    if st.session_state.get("tm_controls") != tm_controls:
+        if st.session_state.get("tm_result") is not None:
+            st.info("Параметры модели объектов изменились. Нажмите «Разместить объекты».")
+        st.session_state["tm_result"] = None
+        st.session_state["tm_metrics"] = None
+        st.session_state["tm_preview"] = None
+        st.session_state["tm_local"] = None
+        st.session_state["tm_controls"] = tm_controls
 
     if st.button("Разместить объекты", type="primary", key="tm_run"):
+        # Не оставляем прежний результат при ошибке параметров/размещения/импорта.
+        st.session_state["tm_result"] = None
+        st.session_state["tm_metrics"] = None
+        st.session_state["tm_preview"] = None
+        st.session_state["tm_local"] = None
         local = LocalCRS(center_lat, center_lon)
         district = build_district_polygon(local, width * 1000.0, height * 1000.0, rotation)
+        tm_curve_line = None
+        if tm_curve_bytes is not None:
+            try:
+                tm_curve_line = load_curve_geojson(json.loads(tm_curve_bytes.decode("utf-8-sig")), local)
+            except (UnicodeDecodeError, ValueError) as exc:
+                st.error(f"Ошибка импорта кривой: {exc}")
+                st.stop()
         try:
             tm_params = SpatialModelParams(
                 model=tm_model,
@@ -579,11 +630,14 @@ with tab_model:
                 rotation_max_deg=float(rot_max),
                 boundary_margin_m=float(boundary_margin),
                 min_distance_m=float(min_distance),
+                max_attempts_per_object=int(max_attempts),
                 n_clusters=int(tm_n_clusters),
                 cluster_sigma_m=float(tm_cluster_sigma),
                 jitter_fraction=float(tm_jitter),
                 n_lines=int(tm_n_lines),
                 line_sigma_m=float(tm_line_sigma),
+                curve_bend_m=float(tm_curve_bend),
+                curve_width_m=float(tm_curve_width),
             )
         except ValueError as exc:
             st.error(f"Ошибка параметров: {exc}")
@@ -591,7 +645,7 @@ with tab_model:
         with st.spinner("Размещение объектов…"):
             try:
                 tm_result = generate_target_objects(
-                    tm_params, district, np.random.default_rng(int(seed)))
+                    tm_params, district, np.random.default_rng(int(seed)), curve=tm_curve_line)
             except PlacementError as exc:
                 st.error(f"Ошибка размещения: {exc}")
                 st.stop()
@@ -601,6 +655,7 @@ with tab_model:
         st.session_state["tm_metrics"] = tm_metrics
         st.session_state["tm_preview"] = tm_preview
         st.session_state["tm_local"] = local
+        st.session_state["tm_curve_source"] = "импортированная линия" if tm_curve_line is not None else "случайная кривая"
 
     tm_result = st.session_state.get("tm_result")
     if tm_result is not None:
@@ -612,6 +667,8 @@ with tab_model:
         with col_r:
             st.subheader("Сводка")
             st.metric("Число объектов", tm_metrics["n_objects"])
+            if tm_result.params.model == "curved":
+                st.metric("Источник кривой", st.session_state.get("tm_curve_source", "случайная кривая"))
             st.metric("Плотность, объектов/км²", f"{tm_metrics['density_per_km2']:.3f}")
             st.metric("Доля площади района", f"{tm_metrics['objects_area_fraction']:.4f}")
             st.metric("Средняя площадь объекта, м²", f"{tm_metrics['objects_area_mean_m2']:,.0f}")
