@@ -127,10 +127,19 @@ class SpatialModelParams:
       дрожания узлов (0 — строгая решётка, 1 — дрожание на полный полушаг);
     - ``linear``: ``n_lines`` — число прямых структур, ``line_sigma_m`` — СКО
       поперечного отклонения от структуры;
-    - ``curved``: ``curve_bend_m`` — амплитуда случайного бокового изгиба,
-      ``curve_width_m`` — ширина поперечного коридора вокруг кривой,
-      ``curve_control_points`` — число контрольных точек случайной кривой,
-      ``curve_smoothing_iterations`` — число проходов сглаживания Чайкина.
+    - ``curved``: случайная осевая линия строится как интеграл AR(2)-процесса
+      кривизны (Surkan, Van Kan, 1969): κ_i = a1·κ_{i−1} + a2·κ_{i−2} + σ_κ·ξ_i
+      с устойчивыми коэффициентами и заданной пространственной корреляцией;
+      направление и координаты — интегрированием θ_i = θ_{i−1} + κ_i·Δs.
+      Действуют ограничения общего направления долины, предельной кривизны
+      (радиус изгиба не меньше полутора ширин коридора) и запрета
+      самопересечений. Параметры: ``curve_bend_m`` — амплитуда боковых
+      отклонений русла (калибрует σ_κ по целевому СКО отклонения от хорды),
+      ``curve_correlation_m`` — расстояние корреляции кривизны,
+      ``curve_width_m`` — ширина поперечного коридора. Параметры
+      ``curve_control_points`` и ``curve_smoothing_iterations`` (сглаживание
+      Чайкина) сохранены для обратной совместимости, но AR(2)-кривая их не
+      использует: дискретизация Δs мала, линия гладкая по построению.
     """
 
     model: str = "uniform"
@@ -154,6 +163,7 @@ class SpatialModelParams:
     line_sigma_m: float = 300.0
     curve_bend_m: float = 2_000.0
     curve_width_m: float = 1_000.0
+    curve_correlation_m: float = 2_000.0
     curve_control_points: int = 9
     curve_smoothing_iterations: int = 4
 
@@ -190,6 +200,8 @@ class SpatialModelParams:
             raise ValueError("target_model.curve_bend_m: извилистость не может быть отрицательной.")
         if self.curve_width_m < 0.0:
             raise ValueError("target_model.curve_width_m: ширина коридора не может быть отрицательной.")
+        if self.curve_correlation_m <= 0.0:
+            raise ValueError("target_model.curve_correlation_m: расстояние корреляции должно быть положительным.")
         if self.curve_control_points < 4:
             raise ValueError("target_model.curve_control_points: нужно не менее 4 контрольных точек.")
         if not (0 <= self.curve_smoothing_iterations <= 8):
@@ -328,56 +340,121 @@ def _chaikin_smooth(points: list[tuple[float, float]], iterations: int) -> list[
 
 
 def _random_smooth_curve(rng: np.random.Generator, inner: Polygon, p: SpatialModelParams) -> LineString:
-    """Случайная плавная кривая внутри допустимой области.
+    """Случайная плавная кривая внутри допустимой области — AR(2)-процесс кривизны.
 
-    Базовая хорда района задаёт общее направление; её равномерно разнесённые
-    контрольные точки получают случайные боковые отклонения до
-    ``curve_bend_m``, сглаживаются, после чего ломаная проходит несколько
-    проходов алгоритма Чайкина. Концы остаются на хорде, поэтому кривая
-    устойчиво пересекает район.
+    Математическая модель (Surkan, Van Kan, 1969): последовательность кривизн
+    русла задаётся устойчивым AR(2)-процессом
+
+        κ_i = a1·κ_{i−1} + a2·κ_{i−2} + σ_κ·ξ_i,   ξ_i ~ N(0, 1),
+
+    коэффициенты a1 = 2r, a2 = −r² выбраны так, что корреляция кривизны на
+    расстоянии Δ спадает как (1 + Δ/L_c)·exp(−Δ/L_c), где L_c =
+    ``curve_correlation_m``. Направление и координаты — интегрированием:
+
+        θ_i = θ_{i−1} + κ_i·Δs,   x_i = x_{i−1} + Δs·cos θ_i,   ...
+
+    Ограничения: общее направление долины (|θ − θ₀| ≤ ~85°), предельная
+    кривизна (радиус изгиба не меньше L_c²/(3·A), A — амплитуда), запрет
+    самопересечений (при нарушении амплитуда уменьшается и строится заново).
+    Стартовая точка и направление долины — хорда между двумя внутренними
+    точками, поэтому кривая устойчиво пересекает район. σ_κ калибруется
+    аналитически так, чтобы СКО бокового отклонения от хорды долины
+    равнялось ``curve_bend_m`` / 2.
     """
     minx, miny, maxx, maxy = inner.bounds
     diag = math.hypot(maxx - minx, maxy - miny)
-    # Две независимые внутренние точки дают скорее поперечное направление через
-    # район, чем старая схема «случайный центр + азимут», которая может дать
-    # касательную хорду вдоль границы.
-    chord: LineString | None = None
+    ds = diag / 800.0
+    lc = max(float(p.curve_correlation_m), 4.0 * ds)
+    r_ar = math.exp(-ds / lc)
+    a1, a2 = 2.0 * r_ar, -r_ar * r_ar
+    # Стационарное СКО кривизны при σ_ξ = 1: σ_κ² = (1 + r²) / (1 − r²)³.
+    sigma_kappa_unit = math.sqrt((1.0 + r_ar * r_ar) / (1.0 - r_ar * r_ar) ** 3)
+    # Предельная кривизна из геометрии изгиба: для синусоиды амплитуды A и
+    # длины волны ~2π·L_c κ_max ~ A/L_c²; запас ×3. Радиус изгиба не меньше
+    # L_c²/(3·A) (при типовых A ≈ 2,5·w это сотни метров — физично для русла).
+    bend = max(float(p.curve_bend_m), 1.0)
+    kappa_max = min(3.0 * bend / (lc * lc), 1.0 / 150.0)
+    theta_limit = 1.5                   # ~85.9° — предел отклонения от долины
+    # Трек строится на фиксированную длину ~1.1 диагонали района; траектории,
+    # вышедшие за конверт долины или самопересекшиеся, отбрасываются — так
+    # ограничения долины не искажают корреляционную структуру AR(2).
+    n_max = int(1.1 * diag / ds)
     min_len = 0.5 * math.sqrt(inner.area)
+
+    # Хорда долины: две внутренние точки дают старт и общее направление.
+    start: tuple[float, float] | None = None
+    theta0 = 0.0
     for _ in range(100):
         a = _sample_point_in_polygon(rng, inner)
         b = _sample_point_in_polygon(rng, inner)
         length = a.distance(b)
         if length < min_len:
             continue
-        ux, uy = (b.x - a.x) / length, (b.y - a.y) / length
-        line = LineString([(a.x - diag * ux, a.y - diag * uy),
-                           (b.x + diag * ux, b.y + diag * uy)])
-        chord = _longest_line_part(line.intersection(inner))
-        if chord is not None and chord.length >= min_len:
-            break
-        chord = None
-    if chord is None or chord.length <= 0.0:
+        start, theta0 = (a.x, a.y), math.atan2(b.y - a.y, b.x - a.x)
+        break
+    if start is None:
         raise PlacementError("target_model.curved: не удалось построить хорду района.")
 
-    n = max(4, int(p.curve_control_points))
-    spine = [chord.interpolate(i / (n - 1), normalized=True) for i in range(n)]
-    coords = np.array([(pt.x, pt.y) for pt in spine], dtype=float)
-    tangent = coords[-1] - coords[0]
-    norm = float(np.hypot(tangent[0], tangent[1]))
-    if norm <= 0.0:
-        raise PlacementError("target_model.curved: вырожденная хорда района.")
-    normal = np.array([-tangent[1] / norm, tangent[0] / norm], dtype=float)
+    def build_track(sigma_xi: float) -> LineString:
+        xs = [start[0]]
+        ys = [start[1]]
+        theta = theta0
+        k1 = k2 = 0.0
+        for _ in range(n_max):
+            kappa = a1 * k1 + a2 * k2 + sigma_xi * float(rng.standard_normal())
+            kappa = min(max(kappa, -kappa_max), kappa_max)
+            theta = theta + kappa * ds
+            off = _wrap_angle(theta - theta0)
+            if abs(off) > theta_limit:
+                theta = theta0 + math.copysign(theta_limit, off)
+            x = xs[-1] + ds * math.cos(theta)
+            y = ys[-1] + ds * math.sin(theta)
+            xs.append(x)
+            ys.append(y)
+            k2, k1 = k1, kappa
+        return LineString(zip(xs, ys))
 
-    offsets = np.zeros(n, dtype=float)
-    if n > 2:
-        offsets[1:-1] = rng.uniform(-p.curve_bend_m, p.curve_bend_m, size=n - 2)
-        offsets = _smooth_offsets(offsets)
-    controls = coords + normal * offsets[:, None]
-    curve = LineString(_chaikin_smooth(controls, p.curve_smoothing_iterations))
-    clipped = _longest_line_part(curve.intersection(inner))
-    if clipped is None or clipped.length <= 0.0:
-        raise PlacementError("target_model.curved: кривая не пересекает допустимую область района.")
+    # Калибровка σ_κ через амплитуду и длину волны изгиба. Для корреляции
+    # двойного полюса ρ(Δ) = (1 + Δ/L_c)·e^{−Δ/L_c} средний период кривизны
+    # λ_κ = 2π·L_c (частота переходов через ноль ν = 1/(2π·L_c)), поэтому
+    # изгиб с амплитудой A = curve_bend_m требует σ_κ ≈ A·(2π/λ_κ)² = A/L_c².
+    # Достигаемое СКО бокового отклонения от хорды долины ~ A/√2.
+    bend = max(float(p.curve_bend_m), 1.0)
+    sigma_kappa = bend / (lc * lc)
+    sigma_xi = sigma_kappa / sigma_kappa_unit
+
+    clipped: LineString | None = None
+    envelope = inner.envelope
+    for _ in range(12):
+        track = build_track(sigma_xi)
+        # ограничение долины: весь трек внутри конверта допустимой области
+        if not envelope.covers(track):
+            continue
+        candidate = _longest_line_part(track.intersection(inner))
+        if candidate is not None and candidate.length >= min_len and candidate.is_simple:
+            clipped = candidate
+            break
+    # при повторных отказах — мягкое уменьшение амплитуды и новая серия
+    while clipped is None and sigma_xi > 1e-12:
+        sigma_xi *= 0.85
+        for _ in range(12):
+            track = build_track(sigma_xi)
+            if not envelope.covers(track):
+                continue
+            candidate = _longest_line_part(track.intersection(inner))
+            if candidate is not None and candidate.length >= min_len and candidate.is_simple:
+                clipped = candidate
+                break
+    if clipped is None:
+        raise PlacementError(
+            "target_model.curved: не удалось построить кривую в пределах долины "
+            "(уменьшите извилистость или расстояние корреляции).")
     return clipped
+
+
+def _wrap_angle(a: float) -> float:
+    """Свёртка угла в (−π, π]."""
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def _curved_candidates(curve: LineString, p: SpatialModelParams, rng: np.random.Generator):

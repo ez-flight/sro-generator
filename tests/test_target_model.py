@@ -190,7 +190,7 @@ class TestCurvedPlacement:
         assert len(r.line_chords) == 1
         curve = r.line_chords[0]
         assert curve.length > 20_000.0
-        # 9 контрольных точек + 4 прохода Чайкина дают существенно более плавную линию.
+        # AR(2)-трек с дискретизацией diag/800 даёт сотни точек гладкой линии.
         assert len(curve.coords) > 100
         assert all(o.group_id == 0 for o in r.objects)
 
@@ -248,6 +248,92 @@ class TestCurvedPlacement:
             "coordinates": [short, long],
         }, local)
         assert curve.length == pytest.approx(20_000.0, rel=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# AR(2)-процесс кривизны (Surkan, Van Kan, 1969)
+# ---------------------------------------------------------------------------
+
+class TestAr2CurvatureCurve:
+    """Свойства случайной кривой как интеграла AR(2)-процесса кривизны."""
+
+    def params(self, bend: float = 2_000.0, lc: float = 2_000.0,
+               width: float = 1_000.0) -> SpatialModelParams:
+        return SpatialModelParams(
+            model="curved", count=1,
+            area_min_m2=50_000.0, area_max_m2=100_000.0,
+            boundary_margin_m=200.0,
+            curve_bend_m=bend, curve_width_m=width, curve_correlation_m=lc,
+        )
+
+    def _curve(self, p: SpatialModelParams, seed: int = 0):
+        r = generate_target_objects(p, DISTRICT, np.random.default_rng(seed))
+        return r.line_chords[0]
+
+    def test_correlation_param_validation(self):
+        with pytest.raises(ValueError, match="curve_correlation"):
+            SpatialModelParams(model="curved", curve_correlation_m=0.0)
+        with pytest.raises(ValueError, match="curve_correlation"):
+            SpatialModelParams(model="curved", curve_correlation_m=-100.0)
+
+    def test_curve_is_simple_and_crosses_district(self):
+        """Нет самопересечений; кривая существенно пересекает район."""
+        p = self.params()
+        for seed in range(5):
+            curve = self._curve(p, seed)
+            assert curve.is_simple
+            assert curve.length > 0.6 * math.sqrt(DISTRICT.area)
+
+    def test_curvature_spatial_correlation(self):
+        """Кривизна коррелирована на расстоянии L_c и некоррелирована на 5·L_c."""
+        lc = 2_000.0
+        curve = self._curve(self.params(lc=lc), seed=1)
+        coords = np.asarray(curve.coords)
+        seg = np.diff(coords, axis=0)
+        ds = float(np.mean(np.hypot(seg[:, 0], seg[:, 1])))
+        theta = np.unwrap(np.arctan2(seg[:, 1], seg[:, 0]))
+        kappa = np.diff(theta) / ds
+
+        def autocorr(k: int) -> float:
+            a, b = kappa[:-k], kappa[k:]
+            a, b = a - a.mean(), b - b.mean()
+            denom = np.sqrt((a ** 2).sum() * (b ** 2).sum())
+            return float((a * b).sum() / denom) if denom > 0 else 0.0
+
+        k_short = max(1, int(round(lc / ds)))
+        k_long = max(k_short + 1, int(round(5.0 * lc / ds)))
+        rho_short = autocorr(k_short)
+        rho_long = autocorr(k_long)
+        # Surkan–Van Kan: корреляция на L_c ≈ 2/e ≈ 0,74, на 5·L_c ≈ 0,04.
+        assert rho_short > 0.15
+        assert rho_short > 4.0 * abs(rho_long)
+
+    def test_bend_amplitude_calibration(self):
+        """СКО бокового отклонения от хорды калибруется под curve_bend_m / 2."""
+        bend = 2_500.0
+        for seed in range(3):
+            curve = self._curve(self.params(bend=bend), seed=seed)
+            coords = np.asarray(curve.coords)
+            d = coords[-1] - coords[0]
+            norm = float(np.hypot(d[0], d[1]))
+            normal = np.array([-d[1], d[0]]) / norm
+            dev = np.abs((coords - coords[0]) @ normal)
+            rms = float(np.sqrt(np.mean(dev ** 2)))
+            assert rms == pytest.approx(bend / 2.0, rel=0.6)
+
+    def test_zero_bend_gives_straight_line(self):
+        """Нулевая извилистость — прямая линия долины."""
+        curve = self._curve(self.params(bend=0.0), seed=0)
+        coords = np.asarray(curve.coords)
+        dev = coords[:, 1] - (coords[0, 1] + (coords[:, 0] - coords[0, 0])
+                              * (coords[-1, 1] - coords[0, 1])
+                              / (coords[-1, 0] - coords[0, 0]))
+        assert float(np.max(np.abs(dev))) < 5.0
+
+    def test_reproducibility(self):
+        a = self._curve(self.params(), seed=7)
+        b = self._curve(self.params(), seed=7)
+        assert a.equals_exact(b, tolerance=1e-9)
 
     def test_bad_geojson_geometry(self):
         local = LocalCRS(55.0, 60.0)
