@@ -3,9 +3,9 @@
 
 Объединяет две ранее разработанные модели:
 
-- целевые объекты наблюдения T — четыре закона пространственного размещения
+- целевые объекты наблюдения T — пять законов пространственного размещения
   (`target_model.generate_target_objects`: равномерно-случайный, кластерный,
-  регулярный, линейный);
+  регулярный, линейный, криволинейный);
 - препятствия оптической съёмке B — поля облачности как площадные полигоны,
   порождаемые тем же ядром пространственных моделей с собственным законом
   размещения и независимым seed (объектная бинарная маска облачности версии
@@ -40,7 +40,7 @@ import math
 from dataclasses import dataclass, field
 
 import numpy as np
-from shapely.geometry import Polygon
+from shapely.geometry import LineString, Polygon
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
@@ -182,17 +182,21 @@ def generate_joint_model(
     district: Polygon,
     target_seed: int,
     obstacle_seed: int,
+    *,
+    target_curve: LineString | None = None,
 ) -> JointModelResult:
     """Сгенерировать совместную модель: объекты T и препятствия B на одном районе.
 
     Обе модели — в единой локальной СК (район общий), seed независимы:
     изменение obstacle_seed не меняет объекты и наоборот. obstacle_params=None
     — район без препятствий (P_скр = 0). При невозможности размещения —
-    PlacementError с указанием модели.
+    PlacementError с указанием модели. ``target_curve`` — импортированная
+    осевая линия для криволинейного закона объектов T (как в target_model).
     """
     try:
         targets = generate_target_objects(
-            target_params, district, _seeded_rng(target_seed, _TARGET_SALT))
+            target_params, district, _seeded_rng(target_seed, _TARGET_SALT),
+            curve=target_curve)
     except PlacementError as exc:
         raise PlacementError(f"joint_model (объекты): {exc}") from exc
 
@@ -358,6 +362,11 @@ def render_joint_map(
             x, y = o.geometry.exterior.xy
             ax.plot(x, y, color="black", linewidth=0.7, alpha=0.8,
                     label="объекты T (контуры)" if i == 0 else None)
+    if result.targets.params.model == "curved" and result.targets.line_chords:
+        for i, chord in enumerate(result.targets.line_chords):
+            cx, cy = chord.xy
+            ax.plot(cx, cy, color="0.4", linestyle="--", linewidth=1.2,
+                    label="осевая линия T (кривая)" if i == 0 else None)
     if on["obstacles"] and result.obstacles:
         for i, o in enumerate(result.obstacles.objects):
             x, y = o.geometry.exterior.xy

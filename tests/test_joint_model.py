@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from shapely.geometry import Point, Polygon, box
+from shapely.geometry import LineString, Point, Polygon, box
 
 from sro_generator.geometry import LocalCRS, build_district_polygon
 from sro_generator.joint_model import (
@@ -158,7 +158,39 @@ class TestJointGeneration:
         r = generate_joint_model(target_params(), None, DISTRICT, 1, 2)
         assert r.obstacles is None
         assert r.geometry.p_skr == 0.0
-        assert r.geometry.p_opt == 1.0
+
+    def test_curved_target_law(self):
+        """Криволинейный закон объектов T: число, инвариант, осевая линия."""
+        p = SpatialModelParams(**{**target_params("curved").__dict__,
+                                  "curve_bend_m": 1500.0, "curve_width_m": 800.0})
+        r = generate_joint_model(p, obstacle_params(), DISTRICT,
+                                 target_seed=3, obstacle_seed=4)
+        assert r.targets.params.model == "curved"
+        assert len(r.targets.objects) == 30
+        assert len(r.targets.line_chords) == 1
+        g = r.geometry
+        assert g.p_opt + g.p_skr == pytest.approx(1.0)
+        for o in r.targets.objects:
+            assert DISTRICT.covers(o.geometry)
+
+    def test_curved_with_imported_curve(self):
+        """Импортированная осевая линия пробрасывается в генерацию объектов T."""
+        p = target_params("curved")
+        curve = LineString([(-10_000.0, -5_000.0), (0.0, 0.0), (10_000.0, 5_000.0)])
+        r = generate_joint_model(p, None, DISTRICT, target_seed=5,
+                                 obstacle_seed=6, target_curve=curve)
+        assert len(r.targets.objects) == 30
+        # объекты лежат в коридоре вокруг импортированной кривой
+        for o in r.targets.objects:
+            assert o.center.distance(curve) <= 0.5 * p.curve_width_m + 1.0
+
+    def test_curved_target_curve_reproducibility(self):
+        p = target_params("curved")
+        a = generate_joint_model(p, obstacle_params(), DISTRICT, 5, 6)
+        b = generate_joint_model(p, obstacle_params(), DISTRICT, 5, 6)
+        assert [o.center.x for o in a.targets.objects] == \
+               [o.center.x for o in b.targets.objects]
+        assert a.geometry.p_skr == b.geometry.p_skr
 
     def test_classification_consistency(self):
         r = generate_joint_model(target_params(count=40), obstacle_params(count=6),

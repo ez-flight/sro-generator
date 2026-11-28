@@ -1027,8 +1027,9 @@ with tab_joint:
                  "и препятствия оптической съёмке B")
     st.caption(
         "Объединение двух пространственных моделей на одном районе (панель «Район» слева) "
-        "с независимыми seed: объекты T — четыре закона размещения (как во вкладке «Модель "
-        "объектов съёмки»), препятствия B — поля облачности тем же ядром (пересечения полей "
+        "с независимыми seed: объекты T — пять законов размещения (как во вкладке «Модель "
+        "объектов съёмки», включая криволинейный вдоль случайной или импортированной из "
+        "GeoJSON кривой), препятствия B — поля облачности тем же ядром (пересечения полей "
         "разрешены). Геометрия досъёмки: U = T ∩ B — участки, требующие РСА; "
         "P_опт = S(T \\ B)/S(T) — исходная полнота оптического покрытия; "
         "P_скр = S(T ∩ B)/S(T) — доля площади объектов, требующая досъёмки; "
@@ -1036,7 +1037,7 @@ with tab_joint:
     )
 
     jc1, jc2, jc3 = st.columns(3)
-    j_law = jc1.selectbox("Закон объектов T", list(MODELS),
+    j_law = jc1.selectbox("Закон объектов T", list(TARGET_MODELS),
                           format_func=lambda m: MODEL_TITLES_RU[m], key="j_law")
     j_seed_t = jc2.number_input("Seed объектов", value=42, step=1, key="j_seed_t")
     j_seed_b = jc3.number_input("Seed препятствий", value=7, step=1, key="j_seed_b")
@@ -1048,9 +1049,26 @@ with tab_joint:
                                disabled=j_law != "cluster", key="j_sig")
     j_jitter = jc6.slider("Дрожание решётки T", 0.0, 1.0, 0.6,
                           disabled=j_law != "regular", key="j_jit")
-    jc7, jc8, _ = st.columns(3)
+    jc7, jc8, jc9 = st.columns(3)
     j_n_lines = jc7.number_input("Линейных структур T", value=4, min_value=1, step=1,
                                  disabled=j_law != "linear", key="j_nl")
+    j_line_sigma = jc8.number_input("СКО поперечного отклонения T, м (линейное)", value=400.0,
+                                    min_value=0.0, disabled=j_law != "linear", key="j_lsig")
+    j_curve_bend = jc9.number_input("Извилистость кривой T, м", value=2500.0, min_value=0.0,
+                                    disabled=j_law != "curved", key="j_cb")
+    jc10, jc11, _ = st.columns(3)
+    j_curve_width = jc10.number_input("Ширина коридора T, м (криволинейное)", value=1000.0,
+                                      min_value=0.0, disabled=j_law != "curved", key="j_cw")
+    j_curve_file = jc11.file_uploader(
+        "Импорт кривой T из GeoJSON", type=["geojson", "json"],
+        disabled=j_law != "curved", key="j_curve_file")
+    if j_law == "curved":
+        st.caption("Если файл не загружен, кривая строится случайно от хорды района; "
+                   "объекты T — равномерно по длине кривой в пределах коридора.")
+
+    j_curve_bytes = j_curve_file.getvalue() if j_curve_file is not None else None
+    j_curve_hash = (hashlib.sha256(j_curve_bytes).hexdigest()
+                    if j_curve_bytes is not None else None)
 
     st.markdown("**Препятствия B (поля облачности)**")
     jb1, jb2, jb3, jb4 = st.columns(4)
@@ -1082,7 +1100,9 @@ with tab_joint:
         float(irregularity), float(rot_min), float(rot_max), float(max_aspect),
         float(min_distance), float(boundary_margin), int(max_attempts),
         str(j_law), int(j_seed_t), int(j_seed_b), int(j_n_clusters), float(j_sigma),
-        float(j_jitter), int(j_n_lines), bool(j_use_obstacles), str(j_b_law),
+        float(j_jitter), int(j_n_lines), float(j_line_sigma), float(j_curve_bend),
+        float(j_curve_width), j_curve_hash,
+        bool(j_use_obstacles), str(j_b_law),
         int(j_b_count), float(j_b_area_min), float(j_b_area_max),
     )
     if st.session_state.get("j_controls") != j_controls:
@@ -1100,6 +1120,13 @@ with tab_joint:
         st.session_state["j_local"] = None
         local = LocalCRS(center_lat, center_lon)
         district = build_district_polygon(local, width * 1000.0, height * 1000.0, rotation)
+        j_curve_line = None
+        if j_curve_bytes is not None:
+            try:
+                j_curve_line = load_curve_geojson(json.loads(j_curve_bytes.decode("utf-8-sig")), local)
+            except (UnicodeDecodeError, ValueError) as exc:
+                st.error(f"Ошибка импорта кривой: {exc}")
+                st.stop()
         try:
             j_t_params = SpatialModelParams(
                 model=j_law, count=int(count),
@@ -1110,7 +1137,9 @@ with tab_joint:
                 boundary_margin_m=float(boundary_margin), min_distance_m=float(min_distance),
                 max_attempts_per_object=int(max_attempts),
                 n_clusters=int(j_n_clusters), cluster_sigma_m=float(j_sigma),
-                jitter_fraction=float(j_jitter), n_lines=int(j_n_lines), line_sigma_m=400.0,
+                jitter_fraction=float(j_jitter), n_lines=int(j_n_lines),
+                line_sigma_m=float(j_line_sigma),
+                curve_bend_m=float(j_curve_bend), curve_width_m=float(j_curve_width),
             )
             j_b_params = None
             if j_use_obstacles:
@@ -1134,7 +1163,8 @@ with tab_joint:
             try:
                 j_result = generate_joint_model(
                     j_t_params, j_b_params, district,
-                    target_seed=int(j_seed_t), obstacle_seed=int(j_seed_b))
+                    target_seed=int(j_seed_t), obstacle_seed=int(j_seed_b),
+                    target_curve=j_curve_line)
             except PlacementError as exc:
                 st.error(f"Ошибка размещения: {exc}")
                 st.stop()
